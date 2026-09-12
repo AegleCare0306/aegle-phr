@@ -1,0 +1,37 @@
+# --- Secrets -----------------------------------------------------------
+# .env holds the real ABDM client secret. It must never be committed.
+# .env.example (placeholders only) IS committed -- hence the negation.
+.env
+.env.*
+!.env.example
+
+# --- Python ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Runtime output ----------------------------------------------------
+# Written by abdm_core's flow_logger / api_capture at the locations
+# injected via configure_paths(). Never commit captured ABDM traffic --
+# it contains real patient identifiers and bearer tokens.
+logs/
+storage/
+
+# --- Local tooling -----------------------------------------------------
+.idea/
+.vscode/
+*.log
+
+# --- Notebooks -----------------------------------------------------------
+# p12/p13/p1e debug notebooks (notebooks/) have real JWT bearer tokens and
+# ABDM sandbox responses saved in their cell outputs from live runs --
+# never commit executed notebooks from this project without stripping
+# outputs first. Checkpoints are the same risk, doubled.
+.ipynb_checkpoints/

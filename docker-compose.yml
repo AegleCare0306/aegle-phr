@@ -1,0 +1,35 @@
+# Local development database for the PHR app.
+#
+# Host port 5433, NOT 5432: 5432 is the default for any Postgres already
+# installed on the machine, and a silent port collision there produces the
+# worst possible failure mode -- the app connects successfully to the wrong
+# database. The container still listens on 5432 internally.
+#
+#   docker compose up -d
+#   alembic upgrade head
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: aegle_phr_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aegle
+      POSTGRES_PASSWORD: aegle
+      POSTGRES_DB: aegle_phr
+    ports:
+      - "5433:5432"
+    volumes:
+      # Named volume, so data survives `docker compose down`. Use
+      # `docker compose down -v` to actually discard it.
+      - aegle_phr_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `alembic upgrade head` immediately after `up -d` otherwise races
+      # the database's own first-boot initialisation.
+      test: ["CMD-SHELL", "pg_isready -U aegle -d aegle_phr"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  aegle_phr_pgdata:

@@ -1,0 +1,733 @@
+@import url("https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&display=swap");
+
+/**
+ * Design system for the Aegle PHR sandbox test harness.
+ *
+ * This file is deliberately still ONE plain CSS file, no framework, no
+ * CSS-in-JS -- see src/components/ui/*.tsx for the React primitives that
+ * consume these classes. Legacy class names from the pre-redesign version
+ * (.panel/.step/.entry/.btn/.chip/etc.) are kept and restyled in place --
+ * not every screen's JSX was rewritten onto the new `ui-*` primitives in
+ * this pass (see the design-overhaul report), so both sets of rules need
+ * to stay visually consistent with each other.
+ *
+ * PALETTE (2026-09-07): retargeted a third time, direct hex values from
+ * Aayush -- gold #CB9C30 / green #154541 / white #DFDED1, Quicksand.
+ * Supersedes the 2026-09-05 "Variation B" pass (green #1A4441 / gold
+ * #C79B3F / bright white #F6F2E8), which itself replaced the original
+ * "Option B" palette (amber #CB9C30 / dark teal #154340 / off-white
+ * #E0DED1) -- note gold here is the exact same value as that very first
+ * amber, green/white are close-but-deliberately-different neighbors of
+ * the original teal/off-white, not a typo for either earlier pass. Those
+ * three hexes are used EXACTLY as given throughout, light and dark;
+ * anywhere a lighter or softer variant is needed it is that same hex at
+ * reduced alpha (or color-mix against the surface), never a new invented
+ * shade.
+ *
+ * Brand roles stay split into the same two groups as the prior palette,
+ * roles unchanged -- only the hexes moved:
+ *   - "fill" (--color-primary-500/600): gold -- solid interactive
+ *     backgrounds (buttons, active pills/tabs, focus rings, borders).
+ *     Always paired with --color-primary-contrast (green) as the text/icon
+ *     color drawn ON TOP of that fill.
+ *   - "text emphasis" (--color-primary-700): green -- brand-colored TEXT
+ *     sitting on the plain page/card surface (card titles, active-tab
+ *     text, hover links). Gold text directly on the white surface reads
+ *     as illegible at body-copy size (same reasoning the prior amber/teal
+ *     palette was built around) -- reserving gold for fills/icons/borders
+ *     and green for on-surface text is what keeps every screen readable
+ *     without touching either hex.
+ */
+
+/* ---------------------------------------------------------------------
+   Design tokens
+   ------------------------------------------------------------------- */
+:root {
+  /* Neutral scale -- white surface, green text, both exact hexes from the
+     approved palette; everything lighter/softer is the same hex at alpha. */
+  --color-bg: #DFDED1;
+  --color-surface: #DFDED1;
+  --color-surface-alt: rgba(21, 69, 65, 0.05);
+  --color-surface-recessed: rgba(21, 69, 65, 0.08);
+  --color-border: rgba(21, 69, 65, 0.22);
+  --color-border-strong: rgba(21, 69, 65, 0.4);
+  --color-text: #154541;
+  --color-text-secondary: rgba(21, 69, 65, 0.78);
+  --color-text-muted: rgba(21, 69, 65, 0.58);
+  --color-text-faint: rgba(21, 69, 65, 0.38);
+
+  /* Brand -- gold fill / green text-emphasis, see banner above */
+  --color-primary-50: rgba(203, 156, 48, 0.12);
+  --color-primary-100: rgba(203, 156, 48, 0.2);
+  --color-primary-500: #CB9C30;
+  --color-primary-600: #CB9C30;
+  --color-primary-700: #154541;
+  --color-primary-contrast: #154541;
+
+  /* Semantic pairs: saturated text/icon color + light background tint + border.
+     Independent of the brand palette on purpose -- status colors (granted/
+     denied/pending, error/ok) need to stay red/green/amber/blue regardless
+     of brand, or two different consent states become indistinguishable. */
+  --color-success: #187a3c;
+  --color-success-bg: #e9f8ee;
+  --color-success-border: #bce6c9;
+  --color-warning: #a35a09;
+  --color-warning-bg: #fef3e2;
+  --color-warning-border: #f2d59f;
+  --color-danger: #b3261e;
+  --color-danger-bg: #fdecea;
+  --color-danger-border: #f3c4bf;
+  --color-info: #1d4fd7;
+  --color-info-bg: #eaf0ff;
+  --color-info-border: #c6d6fb;
+  --color-neutral: #4b5563;
+  --color-neutral-bg: #eef1f4;
+  --color-neutral-border: #dbe1e7;
+
+  /* Typography */
+  --font-sans: "Quicksand", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-mono: 12.5px;
+
+  /* Spacing (4px base) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Radius */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+
+  /* Shadow */
+  --shadow-sm: 0 1px 2px rgba(16, 24, 32, 0.06), 0 1px 1px rgba(16, 24, 32, 0.04);
+  --shadow-md: 0 6px 16px rgba(16, 24, 32, 0.08), 0 2px 4px rgba(16, 24, 32, 0.04);
+  --shadow-lg: 0 16px 32px rgba(16, 24, 32, 0.14);
+
+  /* Legacy aliases some older rules below still reference */
+  --bg: var(--color-bg);
+  --panel: var(--color-surface);
+  --border: var(--color-border);
+  --text: var(--color-text);
+  --muted: var(--color-text-muted);
+  --ok: var(--color-success);
+  --bad: var(--color-danger);
+  --warn: var(--color-warning);
+  --accent: var(--color-primary-600);
+  --mono: var(--font-mono);
+  --sans: var(--font-sans);
+}
+
+/* Dark theme -- same three hexes, roles inverted: green becomes the page/
+   card surface, white carries body text, gold stays the one accent
+   (fills, icons, links) in both themes. Applied via [data-theme] on <html>,
+   set by src/theme.ts; [data-theme="dark"] wins over the system value the
+   same way an explicit choice always beats prefers-color-scheme. */
+[data-theme="dark"] {
+  --color-bg: #154541;
+  --color-surface: #154541;
+  --color-surface-alt: rgba(223, 222, 209, 0.06);
+  --color-surface-recessed: rgba(223, 222, 209, 0.09);
+  --color-border: rgba(223, 222, 209, 0.22);
+  --color-border-strong: rgba(223, 222, 209, 0.38);
+  --color-text: #DFDED1;
+  --color-text-secondary: rgba(223, 222, 209, 0.78);
+  --color-text-muted: rgba(223, 222, 209, 0.58);
+  --color-text-faint: rgba(223, 222, 209, 0.38);
+
+  --color-primary-50: rgba(203, 156, 48, 0.16);
+  --color-primary-100: rgba(203, 156, 48, 0.24);
+  --color-primary-500: #CB9C30;
+  --color-primary-600: #CB9C30;
+  --color-primary-700: #DFDED1;
+  --color-primary-contrast: #154541;
+
+  /* Semantic hues lightened for contrast against a dark page; still
+     outside the brand-palette constraint, see the banner above. */
+  --color-success: #4ADE80;
+  --color-success-bg: rgba(74, 222, 128, 0.14);
+  --color-success-border: rgba(74, 222, 128, 0.35);
+  --color-warning: #FBBF24;
+  --color-warning-bg: rgba(251, 191, 36, 0.14);
+  --color-warning-border: rgba(251, 191, 36, 0.35);
+  --color-danger: #F87171;
+  --color-danger-bg: rgba(248, 113, 113, 0.14);
+  --color-danger-border: rgba(248, 113, 113, 0.35);
+  --color-info: #60A5FA;
+  --color-info-bg: rgba(96, 165, 250, 0.14);
+  --color-info-border: rgba(96, 165, 250, 0.35);
+  --color-neutral: #CBD5E1;
+  --color-neutral-bg: rgba(203, 213, 225, 0.12);
+  --color-neutral-border: rgba(203, 213, 225, 0.3);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+  line-height: 1.55;
+}
+
+/* P14 -- phone-width app shell, not a centered desktop page. --app-max
+   is one token so the top bar / bottom nav (fixed, position:fixed can't
+   inherit a parent's max-width) can line up with the scrolling content
+   at any viewport width, narrow or wide. */
+:root { --app-max: 480px; }
+.app {
+  max-width: var(--app-max); margin: 0 auto; min-height: 100vh; position: relative;
+  background: var(--color-bg); padding: 0 0 88px;
+}
+@media (min-width: 540px) {
+  /* Wide viewport: read as a centered phone frame, not full-bleed text. */
+  .app { box-shadow: var(--shadow-lg); border-left: 1px solid var(--color-border); border-right: 1px solid var(--color-border); }
+}
+.app__content { padding: var(--space-4) var(--space-4) var(--space-6); }
+
+/* ---------------------------------------------------------------------
+   Footer
+   ------------------------------------------------------------------- */
+.footer { margin-top: var(--space-8); padding-top: var(--space-3); border-top: 1px solid var(--color-border); font-size: var(--text-xs); }
+
+/* ---------------------------------------------------------------------
+   Status indicator (connection pill)
+   ------------------------------------------------------------------- */
+.status {
+  display: flex; align-items: center; gap: var(--space-2);
+  border: 1px solid var(--color-border); border-radius: 999px;
+  padding: 6px 8px 6px 12px; background: var(--color-surface); font-size: var(--text-sm);
+  box-shadow: var(--shadow-sm);
+}
+.status__icon { display: flex; align-items: center; flex: none; }
+.status__dot { display: none; } /* superseded by .status__icon; selector kept so nothing errors if referenced */
+.status__label { font-weight: 650; }
+.status__detail { color: var(--color-text-muted); max-width: 420px; }
+.status--reachable .status__icon { color: var(--color-success); }
+.status--reachable .status__label { color: var(--color-success); }
+.status--unauthorized .status__icon { color: var(--color-warning); }
+.status--unauthorized .status__label { color: var(--color-warning); }
+.status--unreachable .status__icon { color: var(--color-danger); }
+.status--unreachable .status__label { color: var(--color-danger); }
+.status--unknown .status__icon,
+.status--unknown .status__label { color: var(--color-text-faint); }
+
+/* ---------------------------------------------------------------------
+   Legacy panel/card family -- restyled to match the new Card component
+   visually (see src/components/ui/Card.tsx) without every screen having
+   been rewritten onto it in this pass.
+   ------------------------------------------------------------------- */
+.main { display: flex; flex-direction: column; gap: var(--space-4); }
+
+.panel {
+  background: var(--color-surface); border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-sm);
+  padding: var(--space-4) var(--space-6) var(--space-6);
+}
+.panel__head { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; margin-bottom: var(--space-2); }
+.panel__head h2 { font-size: var(--text-lg); margin: 0; font-weight: 700; letter-spacing: -0.01em; }
+.panel__head .btn, .panel__head .ui-btn { margin-left: auto; }
+.panel__head .btn + .btn, .panel__head .ui-btn + .ui-btn { margin-left: 0; }
+.panel__empty { margin: var(--space-3) 0 0; }
+
+.notice {
+  background: var(--color-info-bg); border: 1px solid var(--color-info-border); border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4); margin: 0 0 var(--space-4); font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+.notice code { font-family: var(--font-mono); font-size: var(--text-xs); }
+.notice--warn { background: var(--color-warning-bg); border-color: var(--color-warning-border); color: var(--color-text); }
+
+.muted { color: var(--color-text-muted); font-size: var(--text-sm); }
+
+/* ---------------------------------------------------------------------
+   Buttons / inputs -- legacy .btn kept, visually aligned to .ui-btn
+   ------------------------------------------------------------------- */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: inherit; font-size: var(--text-sm); font-weight: 600; padding: 8px 16px; cursor: pointer;
+  background: var(--color-primary-600); color: var(--color-primary-contrast); border: 1px solid var(--color-primary-600); border-radius: var(--radius-sm);
+  text-decoration: none; line-height: 1.3; box-shadow: var(--shadow-sm);
+  transition: filter 0.12s ease, box-shadow 0.12s ease;
+}
+.btn:hover:not(:disabled) { filter: brightness(1.06); box-shadow: var(--shadow-md); }
+.btn:disabled { opacity: 0.5; cursor: default; box-shadow: none; }
+.btn--small { background: var(--color-surface); color: var(--color-text); border-color: var(--color-border); padding: 5px 11px; font-size: var(--text-xs); box-shadow: none; }
+.btn--small:hover:not(:disabled) { border-color: var(--color-primary-500); color: var(--color-primary-700); filter: none; }
+
+input[type="text"], input[type="password"], input[type="email"], select {
+  font: inherit; font-family: var(--font-mono); font-size: var(--text-sm);
+  padding: 8px 10px; border: 1px solid var(--color-border); border-radius: var(--radius-sm);
+  width: 100%; background: var(--color-surface); color: var(--color-text);
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+input[type="text"]:focus, input[type="password"]:focus, input[type="email"]:focus, select:focus {
+  outline: none; border-color: var(--color-primary-500);
+  box-shadow: 0 0 0 3px var(--color-primary-100);
+}
+
+/* ---------------------------------------------------------------------
+   Settings panel
+   ------------------------------------------------------------------- */
+.settings { margin-top: var(--space-4); display: flex; flex-direction: column; gap: var(--space-3); }
+.settings__row { display: grid; grid-template-columns: 120px 1fr; align-items: center; gap: var(--space-3); }
+.settings__row > span { font-size: var(--text-sm); color: var(--color-text-muted); }
+.settings__actions { display: flex; align-items: center; gap: var(--space-4); padding-left: 132px; }
+.settings__hint { margin: 0; padding-left: 132px; }
+.checkbox { display: flex; align-items: center; gap: 6px; font-size: var(--text-sm); color: var(--color-text-muted); }
+
+/* ---------------------------------------------------------------------
+   Result / status text utilities
+   ------------------------------------------------------------------- */
+.result { margin: var(--space-3) 0; font-family: var(--font-mono); font-size: var(--text-mono); }
+dl.result { display: grid; grid-template-columns: 100px 1fr; gap: 4px var(--space-3); }
+dl.result dt { color: var(--color-text-muted); }
+dl.result dd { margin: 0; }
+.result--error { color: var(--color-danger); }
+.ok { color: var(--color-success); font-weight: 650; }
+.bad { color: var(--color-danger); font-weight: 650; }
+
+/* ---------------------------------------------------------------------
+   Console / entries list
+   ------------------------------------------------------------------- */
+.entries { list-style: none; margin: var(--space-3) 0 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+
+.entry {
+  border: 1px solid var(--color-border); border-radius: var(--radius-md); border-left-width: 4px;
+  background: var(--color-surface); box-shadow: var(--shadow-sm);
+}
+.entry--ok { border-left-color: var(--color-success); }
+.entry--error { border-left-color: var(--color-warning); }
+.entry--network { border-left-color: var(--color-danger); }
+
+.entry__head { display: flex; align-items: center; gap: var(--space-3); padding: 7px 12px; font-family: var(--font-mono); font-size: var(--text-xs); }
+.entry__toggle { display: flex; align-items: center; background: none; border: none; cursor: pointer; color: var(--color-text-muted); padding: 0 2px; }
+.entry__status { font-weight: 700; min-width: 34px; }
+.entry--ok .entry__status { color: var(--color-success); }
+.entry--error .entry__status { color: var(--color-warning); }
+.entry--network .entry__status { color: var(--color-danger); }
+.entry__method { color: var(--color-text-muted); min-width: 44px; }
+.entry__url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.entry__ms { color: var(--color-text-muted); }
+.entry__outcome-icon { display: flex; align-items: center; flex: none; }
+.entry--ok .entry__outcome-icon { color: var(--color-success); }
+.entry--error .entry__outcome-icon { color: var(--color-warning); }
+.entry--network .entry__outcome-icon { color: var(--color-danger); }
+
+.entry__body { border-top: 1px solid var(--color-border); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-2); background: var(--color-surface-recessed); border-radius: 0 0 var(--radius-md) var(--radius-md); }
+.field { display: grid; grid-template-columns: 130px 1fr; gap: var(--space-3); align-items: start; }
+.field--block { grid-template-columns: 1fr; }
+.field__label { font-size: var(--text-xs); color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 650; }
+.field__value {
+  margin: 0; font-family: var(--font-mono); font-size: var(--text-mono); white-space: pre-wrap; word-break: break-word;
+  background: var(--color-surface-recessed); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: var(--space-2) var(--space-3); max-height: 340px; overflow: auto;
+}
+
+/* ---------------------------------------------------------------------
+   Register stepper / multi-step flows
+   ------------------------------------------------------------------- */
+.txn { display: flex; align-items: center; gap: var(--space-3); margin: var(--space-3) 0 4px; }
+.txn code { font-family: var(--font-mono); font-size: var(--text-mono); background: var(--color-surface-recessed); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 2px 6px; }
+
+.step {
+  border: 1px solid var(--color-border); border-radius: var(--radius-md); box-shadow: var(--shadow-sm);
+  padding: var(--space-4); margin: var(--space-4) 0 0; background: var(--color-surface);
+}
+.step:disabled { opacity: 0.55; }
+.step > legend {
+  font-size: var(--text-sm); font-weight: 700; padding: 0 var(--space-2); color: var(--color-primary-700);
+  display: flex; align-items: center; gap: 6px;
+}
+.step .btn, .step .ui-btn { margin-top: var(--space-2); }
+
+.row { display: grid; grid-template-columns: 132px 1fr; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }
+.row > span { font-size: var(--text-sm); color: var(--color-text-muted); font-weight: 600; }
+.row select { font: inherit; font-size: var(--text-sm); padding: 6px 8px; border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface); }
+
+.grid { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 0 var(--space-6); }
+
+.suggestions { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--space-3); }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  font: inherit; font-family: var(--font-mono); font-size: var(--text-xs); cursor: pointer;
+  background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 999px; padding: 5px 12px;
+  transition: border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.chip:hover { border-color: var(--color-primary-500); }
+.chip--on { background: var(--color-primary-600); color: var(--color-primary-contrast); border-color: var(--color-primary-600); }
+.chip--on:hover { border-color: var(--color-primary-600); }
+
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+/* ---------------------------------------------------------------------
+   Linked-account picker (mobile OTP login)
+   ------------------------------------------------------------------- */
+.user-list { display: flex; flex-direction: column; gap: var(--space-2); margin: var(--space-3) 0; }
+.user-item {
+  display: block; width: 100%; text-align: left; cursor: pointer;
+  font: inherit; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4); box-shadow: var(--shadow-sm);
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.user-item:hover:not(:disabled) { border-color: var(--color-primary-500); box-shadow: var(--shadow-md); }
+.user-item__address { font-family: var(--font-mono); font-size: var(--text-sm); font-weight: 650; }
+.user-item__meta { font-size: var(--text-xs); color: var(--color-text-muted); margin-top: 2px; }
+.user-item__preferred { font-family: var(--font-sans); font-weight: 600; font-size: var(--text-xs); color: var(--color-primary-700); }
+
+/* ---------------------------------------------------------------------
+   Login screens
+   ------------------------------------------------------------------- */
+.method-list { display: flex; flex-wrap: wrap; gap: var(--space-3); margin: var(--space-4) 0 var(--space-6); }
+.method-btn { text-decoration: none; text-align: center; min-width: 148px; flex-direction: column; padding: var(--space-4) var(--space-3); gap: var(--space-2); }
+.method-btn svg { width: 22px; height: 22px; }
+
+.login-options {
+  display: flex; flex-direction: column; gap: var(--space-3); padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
+}
+.login-option-row { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.login-option-row .btn--small, .login-option-row .ui-btn { text-decoration: none; }
+
+/* =======================================================================
+   New shared UI primitives -- src/components/ui/*.tsx
+   ======================================================================= */
+
+/* --- Card ------------------------------------------------------------ */
+.ui-card {
+  background: var(--color-surface); border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-sm);
+  height: 100%; display: flex; flex-direction: column;
+}
+.ui-card--pad-sm { padding: var(--space-3) var(--space-4); }
+.ui-card--pad-md { padding: var(--space-4) var(--space-6); }
+.ui-card--pad-lg { padding: var(--space-6); }
+.ui-card--interactive { cursor: pointer; transition: box-shadow 0.12s ease, border-color 0.12s ease, transform 0.12s ease; }
+.ui-card--interactive:hover { box-shadow: var(--shadow-md); border-color: var(--color-primary-500); transform: translateY(-1px); }
+.ui-card--flush { border-radius: var(--radius-md); box-shadow: none; }
+fieldset.ui-card { min-width: 0; }
+fieldset.ui-card:disabled { opacity: 0.55; }
+
+.ui-card__header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-2); }
+.ui-card__title { font-size: var(--text-md); font-weight: 700; margin: 0; display: flex; align-items: center; gap: 6px; color: var(--color-primary-700); }
+.ui-card__badge { flex: none; }
+.ui-card__body { display: flex; flex-direction: column; gap: var(--space-2); flex: 1; }
+.ui-card__footer { display: flex; align-items: center; gap: var(--space-2); margin-top: var(--space-3); flex-wrap: wrap; }
+.ui-card__label { font-size: var(--text-xs); color: var(--color-text-muted); font-weight: 650; text-transform: uppercase; letter-spacing: 0.03em; margin: 0; }
+.ui-card__value { font-size: var(--text-sm); margin: 0 0 var(--space-1); }
+
+/* --- CardGrid: the mechanical fix for "boxes should be even sized" --- */
+.ui-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(var(--ui-card-grid-min, 260px), 1fr));
+  gap: var(--space-4);
+  align-items: stretch;
+  margin: var(--space-3) 0 0;
+}
+
+/* --- Button ------------------------------------------------------------ */
+.ui-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  font: inherit; font-weight: 650; cursor: pointer; border-radius: var(--radius-sm);
+  line-height: 1.3; text-decoration: none; white-space: nowrap;
+  transition: filter 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.ui-btn:disabled { opacity: 0.5; cursor: default; box-shadow: none !important; }
+.ui-btn--md { font-size: var(--text-sm); padding: 8px 16px; }
+.ui-btn--sm { font-size: var(--text-xs); padding: 5px 11px; }
+.ui-btn__icon { flex: none; }
+
+.ui-btn--primary { background: var(--color-primary-600); color: var(--color-primary-contrast); border: 1px solid var(--color-primary-600); box-shadow: var(--shadow-sm); }
+.ui-btn--primary:hover:not(:disabled) { filter: brightness(1.06); box-shadow: var(--shadow-md); }
+
+.ui-btn--secondary { background: var(--color-surface); color: var(--color-text); border: 1px solid var(--color-border); }
+.ui-btn--secondary:hover:not(:disabled) { border-color: var(--color-primary-500); color: var(--color-primary-700); }
+
+.ui-btn--ghost { background: transparent; color: var(--color-text-secondary); border: 1px solid transparent; }
+.ui-btn--ghost:hover:not(:disabled) { background: var(--color-surface-alt); color: var(--color-text); }
+
+.ui-btn--danger { background: var(--color-danger-bg); color: var(--color-danger); border: 1px solid var(--color-danger-border); }
+.ui-btn--danger:hover:not(:disabled) { background: var(--color-danger); color: #fff; border-color: var(--color-danger); }
+
+/* --- Badge / status pill ------------------------------------------------ */
+.ui-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: var(--text-xs); font-weight: 650; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid transparent; line-height: 1.4; white-space: nowrap;
+}
+.ui-badge--success { background: var(--color-success-bg); color: var(--color-success); border-color: var(--color-success-border); }
+.ui-badge--warning { background: var(--color-warning-bg); color: var(--color-warning); border-color: var(--color-warning-border); }
+.ui-badge--danger { background: var(--color-danger-bg); color: var(--color-danger); border-color: var(--color-danger-border); }
+.ui-badge--info { background: var(--color-info-bg); color: var(--color-info); border-color: var(--color-info-border); }
+.ui-badge--neutral { background: var(--color-neutral-bg); color: var(--color-neutral); border-color: var(--color-neutral-border); }
+
+/* --- PageHeader -------------------------------------------------------- */
+.ui-page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-4); }
+.ui-page-header__main { display: flex; align-items: flex-start; gap: var(--space-3); }
+.ui-page-header__icon {
+  display: flex; align-items: center; justify-content: center; flex: none;
+  width: 40px; height: 40px; border-radius: var(--radius-md);
+  background: var(--color-primary-50); color: var(--color-primary-600);
+}
+.ui-page-header__title { font-size: var(--text-lg); font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+.ui-page-header__description { font-size: var(--text-sm); color: var(--color-text-muted); margin: 4px 0 0; max-width: 60ch; }
+.ui-page-header__actions { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+
+/* --- EmptyState -----------------------------------------------------------
+   P14: soft double-circle illustration behind the icon, matching the
+   reference app's own empty states (design_reference/03_consents.png)
+   instead of a bare icon glyph. */
+.ui-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center;
+  gap: var(--space-4); padding: var(--space-8) var(--space-4); color: var(--color-text-muted);
+}
+.ui-empty__icon {
+  position: relative; display: flex; align-items: center; justify-content: center;
+  width: 96px; height: 96px; border-radius: 50%; background: var(--color-surface-recessed);
+  color: var(--color-primary-600);
+}
+.ui-empty__icon::before {
+  content: ""; position: absolute; width: 64px; height: 64px; border-radius: 50%; background: var(--color-surface);
+}
+.ui-empty__icon svg { position: relative; }
+.ui-empty__message { margin: 0; font-size: var(--text-sm); font-weight: 650; color: var(--color-primary-700); max-width: 40ch; }
+
+/* --- Callout (inline notice with icon, e.g. disabled-Approve explanation) */
+.ui-callout {
+  display: flex; align-items: flex-start; gap: var(--space-3);
+  border: 1px solid var(--color-info-border); background: var(--color-info-bg);
+  border-radius: var(--radius-md); padding: var(--space-3) var(--space-4);
+  font-size: var(--text-sm); color: var(--color-text-secondary); margin: var(--space-3) 0;
+}
+.ui-callout__icon { flex: none; color: var(--color-info); margin-top: 1px; }
+.ui-callout--warning { background: var(--color-warning-bg); border-color: var(--color-warning-border); }
+.ui-callout--warning .ui-callout__icon { color: var(--color-warning); }
+
+/* --- Tabs (Consent Requests/Approved switcher) -------------------------- */
+.ui-tabs { display: inline-flex; gap: 2px; padding: 3px; background: var(--color-surface-recessed); border-radius: 999px; margin-bottom: var(--space-4); }
+.ui-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: inherit; font-size: var(--text-sm); font-weight: 650; cursor: pointer;
+  padding: 7px 16px; border-radius: 999px; border: none; background: transparent; color: var(--color-text-muted);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.ui-tab:hover { color: var(--color-text); }
+.ui-tab--active { background: var(--color-surface); color: var(--color-primary-700); box-shadow: var(--shadow-sm); }
+
+/* --- RawBody (inline raw-response block, appears throughout the app) --- */
+.ui-raw-body { background: var(--color-surface-recessed); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-2) var(--space-3); }
+.ui-raw-body__toggle {
+  display: flex; align-items: center; gap: 6px; background: none; border: none; cursor: pointer;
+  padding: 0; font: inherit; color: var(--color-text-muted); width: 100%; text-align: left;
+}
+.ui-raw-body__toggle .field__label { margin: 0; }
+.ui-raw-body .field__value { margin-top: var(--space-2); }
+
+/* --- Developer / raw-response panels (Console, RawBody) ------------------ */
+.ui-dev-panel {
+  background: #12181f; color: #d7dee6; border-radius: var(--radius-lg); border: 1px solid #232c36;
+  padding: var(--space-4) var(--space-6) var(--space-6); box-shadow: var(--shadow-sm);
+}
+.ui-dev-panel .panel__head h2 { color: #f2f5f8; }
+.ui-dev-panel .muted { color: #8b98a6; }
+.ui-dev-panel .entry { background: #1a222c; border-color: #2a3440; }
+.ui-dev-panel .entry__url { color: #d7dee6; }
+.ui-dev-panel .entry__body { background: #0e131a; border-top-color: #2a3440; }
+.ui-dev-panel .field__value { background: #0a0e13; border-color: #2a3440; color: #cdd6de; }
+.ui-dev-panel .field__label { color: #7c8896; }
+.ui-dev-panel .btn--small { background: #1a222c; color: #d7dee6; border-color: #2a3440; }
+.ui-dev-panel .btn--small:hover:not(:disabled) { border-color: var(--color-primary-500); color: #fff; }
+.ui-dev-panel .ui-page-header__title { color: #f2f5f8; }
+.ui-dev-panel .ui-page-header__description { color: #8b98a6; }
+.ui-dev-panel .ui-page-header__icon { background: #1a222c; color: var(--color-primary-500); }
+.ui-dev-panel .ui-btn--secondary { background: #1a222c; color: #d7dee6; border-color: #2a3440; }
+.ui-dev-panel .ui-btn--secondary:hover:not(:disabled) { border-color: var(--color-primary-500); color: #fff; }
+.ui-dev-panel .ui-empty { color: #8b98a6; }
+.ui-dev-panel .ui-empty__icon { color: #4a5563; }
+.ui-dev-panel-badge {
+  display: inline-flex; align-items: center; gap: 4px; font-size: var(--text-xs); font-weight: 650;
+  color: #8b98a6; background: #1a222c; border: 1px solid #2a3440; border-radius: 999px; padding: 2px 10px;
+}
+
+/* =======================================================================
+   P14 -- mobile app shell primitives (TopBar, BottomNav, MenuDrawer) and
+   content primitives (ProfileHeader, InfoRow, ListRow, SegmentedControl).
+   See design_reference/*.png for what each is modelled on.
+   ======================================================================= */
+
+/* --- TopBar ------------------------------------------------------------ */
+.ui-top-bar {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: var(--space-3);
+  height: 52px; padding: 0 var(--space-4);
+  background: var(--color-surface); border-bottom: 1px solid var(--color-border);
+}
+.ui-top-bar__menu {
+  display: flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; margin-left: -6px; flex: none;
+  background: none; border: none; border-radius: var(--radius-sm); color: var(--color-text); cursor: pointer;
+}
+.ui-top-bar__menu:hover { background: var(--color-surface-alt); }
+.ui-top-bar__brand {
+  flex: 1; font-size: var(--text-sm); font-weight: 700; color: var(--color-text-muted); letter-spacing: 0.01em;
+}
+.ui-top-bar__right { display: flex; align-items: center; gap: var(--space-2); flex: none; }
+
+/* --- BottomNav ----------------------------------------------------------- */
+.ui-bottom-nav {
+  position: fixed; bottom: 0; left: 50%; transform: translateX(-50%);
+  width: 100%; max-width: var(--app-max); z-index: 20;
+  display: flex; align-items: flex-end; justify-content: space-around;
+  padding: 6px 4px calc(6px + env(safe-area-inset-bottom, 0px));
+  background: var(--color-surface); border-top: 1px solid var(--color-border);
+  box-shadow: var(--shadow-md);
+}
+.ui-bottom-nav__item {
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 3px;
+  flex: 1; min-width: 0; padding: 4px 2px; text-decoration: none;
+  color: var(--color-text-faint); font-size: 10px; font-weight: 650;
+}
+.ui-bottom-nav__icon { display: flex; align-items: center; justify-content: center; }
+.ui-bottom-nav__label { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-bottom-nav__item--active { color: var(--color-primary-700); }
+.ui-bottom-nav__item--raised {
+  color: var(--color-text-muted);
+}
+.ui-bottom-nav__item--raised .ui-bottom-nav__icon {
+  width: 52px; height: 52px; margin-top: -26px; border-radius: 50%;
+  background: var(--color-primary-600); color: var(--color-primary-contrast);
+  box-shadow: var(--shadow-lg); border: 3px solid var(--color-surface);
+}
+.ui-bottom-nav__item--raised .ui-bottom-nav__label { display: none; }
+
+/* --- MenuDrawer ----------------------------------------------------------- */
+.ui-menu-drawer {
+  position: fixed; inset: 0; left: 50%; transform: translateX(-50%);
+  width: 100%; max-width: var(--app-max); z-index: 40;
+  display: flex; flex-direction: column; background: var(--color-bg);
+}
+.ui-menu-drawer__header {
+  /* Fixed green regardless of app theme, same convention as .ui-dev-panel's
+     own fixed-dark styling -- a brand-colored chrome band, not content
+     that should flip with the light/dark toggle. */
+  display: flex; align-items: center; justify-content: space-between; flex: none;
+  height: 52px; padding: 0 var(--space-4);
+  background: #154541; color: #DFDED1;
+}
+.ui-menu-drawer__title { display: flex; align-items: center; gap: var(--space-2); font-weight: 700; }
+.ui-menu-drawer__close { background: none; border: none; color: inherit; cursor: pointer; display: flex; padding: 4px; }
+.ui-menu-drawer__body { flex: 1; overflow-y: auto; padding: var(--space-2) 0 var(--space-6); }
+.ui-menu-drawer__section { margin: var(--space-4) var(--space-4) 0; }
+.ui-menu-drawer__section-title {
+  font-size: var(--text-xs); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--color-text-faint); margin: 0 0 var(--space-2);
+}
+
+/* --- ListRow -------------------------------------------------------------- */
+.ui-list-row {
+  display: flex; align-items: center; gap: var(--space-3); width: 100%;
+  min-height: 52px; padding: var(--space-3) var(--space-4);
+  background: none; border: none; border-bottom: 1px solid var(--color-border);
+  font: inherit; font-size: var(--text-md); color: var(--color-text); text-align: left; cursor: pointer;
+}
+.ui-list-row:hover { background: var(--color-surface-alt); }
+.ui-list-row__icon { display: flex; align-items: center; justify-content: center; flex: none; color: var(--color-primary-600); }
+.ui-list-row__label { flex: 1; font-weight: 600; }
+.ui-list-row__chevron { flex: none; color: var(--color-text-faint); }
+
+/* Rows inside a Card read as a self-contained list, not page-width. */
+.ui-card .ui-list-row { padding-left: 0; padding-right: 0; }
+.ui-card .ui-list-row:last-child { border-bottom: none; }
+
+/* --- InfoRow -------------------------------------------------------------- */
+.ui-info-row {
+  display: flex; align-items: center; gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+.ui-info-row__icon { display: flex; align-items: center; justify-content: center; flex: none; color: var(--color-primary-600); }
+.ui-info-row__text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ui-info-row__label { font-size: var(--text-xs); color: var(--color-text-muted); }
+.ui-info-row__value { font-size: var(--text-md); font-weight: 700; color: var(--color-primary-700); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-info-row__trailing { flex: none; }
+
+.ui-info-stack { display: flex; flex-direction: column; gap: var(--space-2); }
+.ui-info-split { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
+.ui-info-split .ui-info-row { flex-direction: column; align-items: flex-start; text-align: left; }
+
+/* --- ProfileHeader ---------------------------------------------------- */
+.ui-profile-header {
+  background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm); overflow: hidden;
+}
+.ui-profile-header__banner {
+  /* Fixed green regardless of app theme -- same reasoning as .ui-menu-drawer__header above. */
+  height: 88px; position: relative;
+  background:
+    repeating-linear-gradient(135deg, rgba(223, 222, 209, 0.08) 0 18px, transparent 18px 36px),
+    #154541;
+}
+.ui-profile-header__avatar {
+  position: absolute; left: 50%; bottom: -36px; transform: translateX(-50%);
+  width: 84px; height: 84px; border-radius: 50%; overflow: hidden;
+  background: var(--color-surface-recessed); border: 4px solid var(--color-surface); box-shadow: var(--shadow-md);
+  display: flex; align-items: center; justify-content: center;
+}
+.ui-profile-header__avatar img { width: 100%; height: 100%; object-fit: cover; }
+.ui-profile-header__avatar-fallback { font-size: 28px; font-weight: 700; color: var(--color-text-faint); }
+.ui-profile-header__body {
+  padding: 44px var(--space-4) var(--space-4); text-align: center;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+}
+.ui-profile-header__name { margin: 0; font-size: var(--text-lg); font-weight: 700; }
+.ui-profile-header__kyc { margin: 0; display: flex; align-items: center; gap: 5px; font-size: var(--text-sm); font-weight: 650; }
+.ui-profile-header__kyc--success { color: var(--color-success); }
+.ui-profile-header__kyc--warning { color: var(--color-warning); }
+.ui-profile-header__kyc--neutral { color: var(--color-text-muted); }
+.ui-profile-header__switch {
+  margin-top: 2px; background: none; border: none; cursor: pointer;
+  display: flex; align-items: center; gap: 5px; font: inherit; font-size: var(--text-sm); font-weight: 700;
+  color: var(--color-primary-700);
+}
+
+/* --- Search input (P14, e.g. HomeScreen's facility filter) ------------ */
+.ui-search {
+  position: relative; display: flex; align-items: center; margin: var(--space-3) 0;
+}
+.ui-search__icon { position: absolute; left: 12px; color: var(--color-text-faint); pointer-events: none; }
+.ui-search input[type="text"] { padding-left: 38px; font-family: var(--font-sans); }
+
+/* --- SegmentedControl ------------------------------------------------- */
+.ui-segmented {
+  display: flex; gap: 2px; padding: 3px;
+  background: var(--color-surface-recessed); border-radius: 999px; margin-bottom: var(--space-3);
+}
+.ui-segmented__option {
+  flex: 1; font: inherit; font-size: var(--text-sm); font-weight: 700; cursor: pointer;
+  padding: 9px 10px; border: none; border-radius: 999px; background: transparent; color: var(--color-primary-700);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.ui-segmented__option--active { background: var(--color-primary-700); color: var(--color-bg); }
+
+/* Lighter, underline-style status filter row underneath a SegmentedControl.
+   Wrapped in .ui-status-filter-bar so a scrollable option row (more
+   statuses than fit at phone width) and a fixed Refresh button can sit
+   side by side without the button scrolling out of view. */
+.ui-status-filter-bar { display: flex; align-items: center; gap: var(--space-3); margin: 0 0 var(--space-4); border-bottom: 1px solid var(--color-border); }
+.ui-status-filter { display: flex; gap: var(--space-4); overflow-x: auto; flex: 1; min-width: 0; }
+.ui-status-filter__option {
+  font: inherit; font-size: var(--text-sm); font-weight: 650; color: var(--color-text-muted); white-space: nowrap;
+  background: none; border: none; cursor: pointer; padding: var(--space-2) 0 10px; border-bottom: 2px solid transparent;
+}
+.ui-status-filter__option--active { color: var(--color-primary-700); border-bottom-color: var(--color-primary-700); }
+.ui-status-filter__refresh { flex: none; margin-bottom: 6px; }
