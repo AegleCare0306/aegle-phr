@@ -54,17 +54,28 @@ def trigger_consent_fetch(settings: Settings, consent_id: str, hiu_id: str) -> d
     """
     Manually fetches a GRANTED consent's artefact.
 
-    WHY THIS STILL EXISTS. The normal trigger is
+    A RECOVERY LEVER, NOT THE NORMAL PATH -- and no longer a provisional
+    one. The normal trigger is
     hiu_services.handle_consent_request_notify(), which fetches every
-    artefact the moment ABDM reports a grant. But a notify that never
-    arrives has been observed live (2026-09-02: six PATRQT requests all got
-    their on-init ack and not one ever produced a notify, all day, while
-    CAREMGT requests the same day notified normally). When that happens the
-    consent is genuinely GRANTED -- visible in the Consent Manager -- and
-    the artefact is simply never fetched, so no data request can cite it.
-    This function supplies the trigger the missing callback would have
-    supplied. The downstream half (on-fetch storing the artefact, then
-    chaining into the data request) is identical either way.
+    artefact the moment ABDM reports a grant.
+
+    THE QUESTION THIS WAS KEPT PENDING IS NOW ANSWERED. It was retained on
+    the evidence of 2026-09-02, when six PATRQT requests each got their
+    on-init ack and not one ever produced a notify all day, while CAREMGT
+    requests the same day notified normally -- leaving consents GRANTED in
+    the Consent Manager but never fetched, so no data request could cite
+    them. That reading is now superseded: on 2026-09-23, under the locker's
+    own registration, the notify -> fetch chain fired on its own SIX times
+    out of six (four initial-sync consents plus a LINK and a DATA alert).
+    The earlier silence was a symptom of the self-view arrangement P19
+    removed, not of PATRQT consents as such.
+
+    So this is kept deliberately, as the manual lever for a notify that
+    genuinely goes missing -- not because the chain is unproven. One day's
+    evidence, on one patient and one locker, is enough to stop treating it
+    as the expected path; it is not enough to justify deleting a working
+    recovery route. The downstream half (on-fetch storing the artefact,
+    then chaining into the data request) is identical either way.
 
     Returns {"ok": True, "status": 202} on acceptance. The artefact still
     arrives asynchronously on the on-fetch callback -- this does not wait

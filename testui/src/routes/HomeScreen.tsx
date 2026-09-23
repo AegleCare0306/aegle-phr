@@ -94,8 +94,10 @@ import {
 
 import {
   getAllConsentArtefacts,
+  declineLocker,
   getLockerRecords,
   getLockerStatus,
+  setupPatientLocker,
   getAllLinkedRecords,
   getHealthInformationStatus,
   getProfile,
@@ -939,6 +941,50 @@ function FhirRecordCard({ bundle, hipLabel }: { bundle: unknown; hipLabel: strin
  * What IS worth telling them apart is whether the locker is switched on
  * at all -- that is the one thing they can act on.
  */
+/**
+ * P20 -- the first-login opt-in prompt.
+ *
+ * WHY IT BELONGS HERE. The locker collects a patient's records
+ * automatically, which is a thing to ASK for rather than assume. The
+ * backend has always been built for this -- LockerStatus.needsOptIn exists
+ * precisely to gate it -- but nothing ever rendered it, so opting in was
+ * only reachable by knowing to go to the Subscriptions screen. A new
+ * patient would land on an empty Home with no indication that anything was
+ * available, which reads as "this app has none of my records".
+ *
+ * ASKS ONCE, AND TAKES NO FOR AN ANSWER. needsOptIn is false once the
+ * patient has answered either way (locker_repository records ALLOWED or
+ * DECLINED with the timestamp), so declining makes this disappear rather
+ * than nagging on every login. Turning it on later still lives under
+ * Subscriptions, which is where someone who changed their mind would look.
+ */
+function LockerOptInPrompt({
+  busy,
+  onAllow,
+  onDecline,
+}: {
+  busy: boolean;
+  onAllow: () => void;
+  onDecline: () => void;
+}): JSX.Element {
+  return (
+    <Callout tone="info">
+      <p style={{ margin: 0, fontWeight: 600 }}>Collect my records automatically?</p>
+      <p style={{ margin: "var(--space-2) 0 0" }}>
+        Your health locker can gather records from the hospitals you visit, so they are already here
+        the next time you open the app. You stay in control — you can turn this off at any time, and
+        everything collected is deleted when you do.
+      </p>
+      <div style={{ display: "flex", gap: "var(--space-2)", marginTop: "var(--space-3)" }}>
+        <Button variant="primary" disabled={busy} onClick={onAllow}>
+          {busy ? "Setting up…" : "Allow"}
+        </Button>
+        <Button disabled={busy} onClick={onDecline}>Not now</Button>
+      </div>
+    </Callout>
+  );
+}
+
 function NoCoverageCallout({ lockerOn }: { lockerOn: boolean }): JSX.Element {
   if (!lockerOn) {
     return (
@@ -997,6 +1043,41 @@ export function HomeScreen(): JSX.Element {
   /** P20 -- NOT_STARTED / RUNNING / DONE / FAILED for the one-off backfill. */
   const [lockerSyncState, setLockerSyncState] = useState<string>("");
   const [lockerRecordCount, setLockerRecordCount] = useState<number>(0);
+  const [optInBusy, setOptInBusy] = useState(false);
+
+  /** Re-reads locker status after the patient answers the opt-in prompt. */
+  async function refreshLockerStatus(): Promise<void> {
+    const result = await getLockerStatus({ xToken: sessionToken, patientAbhaAddress: sessionAddress });
+    if (result.data) setLockerStatus(result.data);
+  }
+
+  /**
+   * Allow -> 8.3.18 Setup Locker, which creates the already-granted
+   * subscription AND its auto-approval policy in one call. The records read
+   * afterwards starts the one-off backfill, so history begins arriving
+   * without a second action from the patient.
+   */
+  async function handleLockerAllow(): Promise<void> {
+    setOptInBusy(true);
+    try {
+      await setupPatientLocker({ xToken: sessionToken, patientAbhaAddress: sessionAddress });
+      await refreshLockerStatus();
+      await loadLockerRecords();
+    } finally {
+      setOptInBusy(false);
+    }
+  }
+
+  /** "Not now" -- recorded so the prompt stops asking. Not an opt-out: nothing was ever collected. */
+  async function handleLockerDecline(): Promise<void> {
+    setOptInBusy(true);
+    try {
+      await declineLocker({ patientAbhaAddress: sessionAddress, optedOut: false });
+      await refreshLockerStatus();
+    } finally {
+      setOptInBusy(false);
+    }
+  }
 
   /**
    * P20 -- reads the locker's own storage and seeds the per-HIP display
@@ -1588,6 +1669,19 @@ export function HomeScreen(): JSX.Element {
 
       {profileResult !== null && profileResult.data?.ok !== true && (
         <p className="result result--error">Couldn&apos;t load your profile — check the Console for details.</p>
+      )}
+
+      {/*
+        P20 -- ask before collecting. Rendered above the sync banner on
+        purpose: until the patient has answered, there is nothing syncing
+        and nothing to explain waiting for.
+      */}
+      {lockerStatus?.needsOptIn === true && (
+        <LockerOptInPrompt
+          busy={optInBusy}
+          onAllow={() => { void handleLockerAllow(); }}
+          onDecline={() => { void handleLockerDecline(); }}
+        />
       )}
 
       {/*

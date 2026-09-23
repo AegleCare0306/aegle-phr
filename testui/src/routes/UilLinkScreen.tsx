@@ -145,6 +145,29 @@ function extractCallbackError(detail: unknown): string | null {
   return [code, message].filter((v) => v !== "").join(" — ") || "ABDM returned an error with no further detail.";
 }
 
+/**
+ * ABDM's own error out of an IMMEDIATE response body (not a callback), with
+ * the one case a patient will realistically hit written in plain language.
+ *
+ * ABDM-9999 "Duplicate Discovery request" fires when a discovery for this
+ * same patient and facility is still open on ABDM's side -- confirmed live
+ * 2026-09-23. It outlives this screen, so the in-flight `busy` guard does
+ * NOT prevent it: starting a search, navigating away and coming back is
+ * enough to trigger it. Without this the patient sees the generic
+ * "check the Console" fallback for something that is neither their mistake
+ * nor fixable by pressing the button again straight away.
+ */
+function describeRequestError(body: unknown): string | null {
+  const error = objField(body, "error");
+  if (error === null) return null;
+  const message = typeof error.message === "string" ? error.message : "";
+  const code = typeof error.code === "string" ? error.code : "";
+  if (/duplicate discovery/i.test(message)) {
+    return "A record search is already running for this facility. Give it a minute and try again — ABDM allows only one search at a time per facility.";
+  }
+  return [code.trim().replace(/:$/, ""), message].filter((v) => v !== "").join(" — ") || null;
+}
+
 function extractPatientMatches(detail: unknown): PatientMatch[] {
   const record = detail !== null && typeof detail === "object" ? (detail as Record<string, unknown>) : {};
   const rawPatients = record.patient;
@@ -277,7 +300,11 @@ export function UilLinkScreen(): JSX.Element {
       setDiscoverResult(result);
       const requestId = result.data?.requestId;
       if (result.data?.ok !== true || !requestId) {
-        setErrorMessage(result.data?.error || "Couldn't start discovery — check the Console for details.");
+        setErrorMessage(
+          describeRequestError(result.data?.body)
+            || result.data?.error
+            || "Couldn't start discovery — check the Console for details.",
+        );
         return;
       }
       setPhase("discovering");

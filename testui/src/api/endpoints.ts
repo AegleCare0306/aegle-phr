@@ -686,7 +686,19 @@ export interface TriggerConsentFetchBody {
   hiuId: string;
 }
 
-/** P12 -- explicitly triggers repo/'s own fetch_consent() for a GRANTED consent, sidestepping ABDM's own HIU-notify callback, which real evidence shows never fires for a self-requested (PATRQT) consent. See data_flow.py's own trigger_consent_fetch() docstring. 202 Accepted expected, empty body on success -- the real detail still arrives later via the (separately, already proven working) on-fetch callback. */
+/**
+ * Manual section 6 consent fetch for a GRANTED consent -- a RECOVERY lever
+ * for a notify that went missing, not the normal path.
+ *
+ * Two things in the previous version of this comment are now wrong and have
+ * been corrected. It is no longer repo/'s fetch_consent() (P20 moved the
+ * whole section 6/7 stack into this app), and "never fires for a PATRQT
+ * consent" was disproven on 2026-09-23: under the locker's own
+ * registration the notify -> fetch chain fired unaided 6 times out of 6.
+ *
+ * 202 Accepted expected, empty body on success -- the artefact still
+ * arrives later on the on-fetch callback.
+ */
 export function triggerConsentFetch(body: TriggerConsentFetchBody): Promise<ApiResult<AbdmPassthrough>> {
   return apiRequest<AbdmPassthrough>("/phr/data-flow/trigger-consent-fetch", { method: "POST", body });
 }
