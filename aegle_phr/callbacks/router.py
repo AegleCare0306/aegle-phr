@@ -2,30 +2,34 @@
 Inbound ABDM callback routes owned by the PHR app.
 
 =============================================================================
-PATHS THIS REPO DELIBERATELY DOES NOT OWN -- READ BEFORE ADDING A ROUTE
+THE FIVE HIU PATHS, AND WHY THEY ARE CONDITIONAL
 =============================================================================
-The PHR is designed to run IN THE SAME PROCESS as the existing ABDM backend
-(one client ID, one callback URL, one ngrok host -- so one place for ABDM
-callbacks to land). Two routers in one FastAPI app cannot both own a path:
-whichever is included first wins, silently, and the other's handler simply
-never runs.
-
-These four paths are already registered and handled by the existing
-backend's M3 HIU code (repo/server/callbacks/router.py, lines ~114-144).
-They must NOT be added here without an explicit, deliberate decision about
-which app owns the flow:
+Two routers in one FastAPI app cannot both own a path: whichever is
+included first wins, silently, and the other's handler never runs. That
+constraint has not gone away -- what changed in P20 is that there are now
+two DEPLOYMENTS, and the right owner differs between them.
 
     /api/v3/hiu/consent/request/on-init
     /api/v3/hiu/consent/request/notify
     /api/v3/hiu/consent/on-fetch
     /api/v3/hiu/health-information/on-request
+    /api/v3/hiu/health-information/push
 
-Adding one of them here would not fail loudly. It would produce a
-consent/data flow that works in standalone PHR testing and then silently
-stops working -- or worse, half-works -- the moment the two apps are
-mounted together. If the PHR genuinely needs to participate in those
-flows, the answer is to route them in ONE place and fan out, not to
-register the path twice.
+MOUNTED (settings.abdm_locker_owns_hiu_callbacks = False, the default):
+aegle_phr runs inside repo/server/main.py, sharing one client id and one
+callback URL. repo/server/callbacks/router.py owns all five; this router
+registers none of them, exactly as before P20.
+
+STANDALONE (= True): the locker runs as its own registered ABDM entity --
+own client id, own callback URL, own port -- and nothing else in the
+process can own them. It MUST handle them itself; a PHR app that cannot
+complete its own consent and data flow is not independent in any
+meaningful sense, which was the whole point of P20.
+
+Registering them unconditionally would silently half-break the mounted
+deployment. Registering them never was what made the PHR app unable to
+stand alone. This flag is the honest answer to a genuine fork, not a
+feature toggle -- set it once per deployment and leave it.
 =============================================================================
 
 Every route below is a plain `def`, not `async def`. See aegle_phr/db.py
@@ -40,7 +44,7 @@ from abdm_core.callback_auth import verify_abdm_callback
 from abdm_core.http import generate_request_id
 from abdm_core.observability.flow_logger import log_error, set_correlation_id
 
-from aegle_phr.callbacks import subscription_services, uil_services
+from aegle_phr.callbacks import hiu_services, subscription_services, uil_services
 from aegle_phr.callbacks.dispatcher import dispatch
 from aegle_phr.settings import Settings
 
@@ -67,7 +71,7 @@ CALLBACK_ROUTES: tuple[tuple[str, str], ...] = (
     # (subscription/notify vs subscription-requests/hiu/notify) -- do not
     # conflate them, see CC_PROMPT_P13_subscription_flow_full_build.md's
     # own URL table for the full discrepancy note. Not previously
-    # registered anywhere and not in FORBIDDEN_PATHS below.
+    # registered anywhere and does not collide with the five HIU paths below.
     ("/api/v3/hiu/subscription/notify", "subscription_care_context_notify"),
 )
 
@@ -79,7 +83,7 @@ CALLBACK_ROUTES: tuple[tuple[str, str], ...] = (
 # above ever changes.
 _SUBSCRIPTION_HANDLERS: dict[str, Callable[[Settings, Any, str | None], None]] = {
     "subscription_on_init": lambda settings, payload, request_id_header: subscription_services.handle_subscription_on_init(settings, payload, request_id_header),
-    "subscription_notify": lambda settings, payload, request_id_header: subscription_services.handle_subscription_notify(settings, payload),
+    "subscription_notify": lambda settings, payload, request_id_header: subscription_services.handle_subscription_notify(settings, payload, request_id_header),
     "subscription_care_context_notify": lambda settings, payload, request_id_header: subscription_services.handle_subscription_care_context_notify(settings, payload, request_id_header),
 }
 
@@ -93,14 +97,31 @@ _UIL_HANDLERS: dict[str, Callable[[Settings, Any, str | None], None]] = {
     "on_confirm": lambda settings, payload, request_id_header: uil_services.handle_on_confirm(settings, payload, request_id_header),
 }
 
-# Paths listed above in the banner. Kept as data as well as prose so a test
-# can assert they are absent -- see the repo README's verification notes.
-FORBIDDEN_PATHS: tuple[str, ...] = (
-    "/api/v3/hiu/consent/request/on-init",
-    "/api/v3/hiu/consent/request/notify",
-    "/api/v3/hiu/consent/on-fetch",
-    "/api/v3/hiu/health-information/on-request",
+# P20 -- the five HIU paths from this module's own banner, registered ONLY
+# when settings.abdm_locker_owns_hiu_callbacks is true. Kept as data as
+# well as prose so a test can assert they are absent in the mounted
+# deployment and present in the standalone one.
+#
+# The push path is the odd one out: the HIP posts to it DIRECTLY, not
+# through the gateway, because we supply it ourselves as dataPushUrl on
+# the section 7 request. It is grouped here anyway -- same ownership
+# question, same answer -- and still sits behind verify_abdm_callback,
+# since the HIP's push is signed the same way.
+HIU_CALLBACK_ROUTES: tuple[tuple[str, str], ...] = (
+    ("/api/v3/hiu/consent/request/on-init", "consent_request_on_init"),
+    ("/api/v3/hiu/consent/request/notify", "consent_request_notify"),
+    ("/api/v3/hiu/consent/on-fetch", "consent_on_fetch"),
+    ("/api/v3/hiu/health-information/on-request", "health_information_on_request"),
+    ("/api/v3/hiu/health-information/push", "health_information_push"),
 )
+
+_HIU_HANDLERS: dict[str, Callable[[Settings, Any, str | None], None]] = {
+    "consent_request_on_init": lambda settings, payload, request_id_header: hiu_services.handle_consent_request_on_init(settings, payload, request_id_header),
+    "consent_request_notify": lambda settings, payload, request_id_header: hiu_services.handle_consent_request_notify(settings, payload, request_id_header),
+    "consent_on_fetch": lambda settings, payload, request_id_header: hiu_services.handle_consent_on_fetch(settings, payload, request_id_header),
+    "health_information_on_request": lambda settings, payload, request_id_header: hiu_services.handle_health_information_on_request(settings, payload, request_id_header),
+    "health_information_push": lambda settings, payload, request_id_header: hiu_services.handle_health_information_push(settings, payload, request_id_header),
+}
 
 # ABDM's standard acknowledgement. Matches the existing backend's
 # server/callbacks/utils/response.py success() exactly, so both apps ack
@@ -155,9 +176,13 @@ def _make_handler(callback_type: str, settings: Settings):
         # so a bug in real handler logic can NEVER surface to ABDM as a
         # non-2xx -- same "never raise past the callback route" contract
         # dispatch() itself upholds, just enforced one layer up instead of
-        # inside it. Two separate dicts (one per feature area), checked in
+        # inside it. Separate dicts (one per feature area), checked in
         # turn -- callback_type namespaces don't overlap between them.
-        real_handler = _SUBSCRIPTION_HANDLERS.get(callback_type) or _UIL_HANDLERS.get(callback_type)
+        real_handler = (
+            _SUBSCRIPTION_HANDLERS.get(callback_type)
+            or _UIL_HANDLERS.get(callback_type)
+            or _HIU_HANDLERS.get(callback_type)
+        )
         if real_handler is not None:
             try:
                 # ABDM's own REQUEST-ID header on THIS inbound callback --
@@ -192,7 +217,14 @@ def build_callback_router(settings: Settings) -> APIRouter:
     # an unverified request never reaches dispatch() and gets a real 401.
     router = APIRouter(dependencies=[Depends(verify_abdm_callback)])
 
-    for path, callback_type in CALLBACK_ROUTES:
+    # P20 -- the five HIU paths only when this deployment owns them. See
+    # this module's own banner for why this is a deployment fork rather
+    # than an unconditional registration.
+    routes = CALLBACK_ROUTES
+    if settings.abdm_locker_owns_hiu_callbacks:
+        routes = routes + HIU_CALLBACK_ROUTES
+
+    for path, callback_type in routes:
         router.add_api_route(
             path,
             _make_handler(callback_type, settings),

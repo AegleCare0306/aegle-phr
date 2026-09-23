@@ -13,14 +13,28 @@ module in aegle_phr/phr/: Authorization (gateway, as always) + X-AUTH-TOKEN
 see links.py/consent.py for that other convention) + X-CM-ID + X-HIU-ID
 (this app's own HIU identity) + REQUEST-ID/TIMESTAMP.
 
-X-HIU-ID = settings.abdm_hiu_id, set to CLIENT_ID (SBXID_046112) -- this
-project's own established self-service pattern, independently confirmed
-three other ways already (Data Flow's self-view fetch, Subscription Flow's
-self-subscription, Consent Auto-Approval's own hiu.id correction -- see
-that setting's own docstring and .env's own comment). STILL FLAG FOR LIVE
-CONFIRMATION before link_init() specifically (the OTP-consuming step) --
-same discipline this project applied the last two times this exact value
-was reused for a new endpoint family.
+X-HIU-ID = settings.abdm_hiu_id, which must be THE PHR FACILITY ID
+(IN3310002290), NOT the client/bridge id. SETTLED LIVE 2026-09-23 by
+running 10.3.1 discover once per candidate -- safe to do, because discover
+consumes no OTP:
+
+    X-HIU-ID = SBXID_073333 (bridge/client id)  -> 400, "Invalid HIU ID"
+    X-HIU-ID = IN3310002290 (PHR facility id)   -> 202, and the on-discover
+                                                   callback came back with
+                                                   real care-context matches
+
+This supersedes the earlier reading, which had it as CLIENT_ID by analogy
+with Data Flow's self-view fetch, Subscription Flow's self-subscription and
+Consent Auto-Approval's hiu.id. The analogy was wrong for this family, and
+it is WHY this flow was paused: the correct value did not exist until the
+facility was registered with ABDM as a PHR service. Note the failure would
+have been caught at discover, before ever reaching the OTP-consuming
+link_init() -- the "confirm before link_init" flag was the right caution
+but the risk it guarded was smaller than it looked.
+
+NOTE the mounted deployment's own .env still carries the old client-id
+value for this setting. UIL has never been exercised there and would fail
+the same way; it would need that deployment's own PHR facility id.
 
 NO ENCRYPTION ANYWHERE IN THIS FAMILY -- confirmed from the spec's own
 examples across all three calls (unverifiedIdentifiers[].value,

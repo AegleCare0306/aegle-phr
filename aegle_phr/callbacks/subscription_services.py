@@ -19,7 +19,7 @@ from typing import Any
 
 from abdm_core.observability.flow_logger import log_error, log_phase
 
-from aegle_phr.phr import subscription
+from aegle_phr.phr import locker_repository, locker_service, subscription
 from aegle_phr.phr.subscription_repository import (
     get_by_subscription_request_id,
     link_subscription_request_id,
@@ -30,10 +30,17 @@ from aegle_phr.settings import Settings
 
 def handle_subscription_on_init(settings: Settings, payload: Any, request_id_header: str | None) -> None:
     """
-    8.3.3 -- correlates the callback's response.requestId back to the row
-    saved by data_flow.py's own ensure_self_subscription() (mirrors repo/
+    8.3.3 -- correlates the callback's response.requestId back to the
+    pending row saved when the subscription was initiated (mirrors repo/
     server/callbacks/services/consent_init_on_init_service.py's identical
-    correlation shape for consent's 6.5), then calls 8.3.6 to ack receipt.
+    correlation shape for consent's 6.5).
+
+    NO ACKNOWLEDGEMENT IS SENT HERE (corrected in P19). Spec section 8.2's
+    own sequence diagrams show init -> on-init with nothing sent back;
+    8.3.6 acknowledges the DECISION callback (hiu/notify) instead, and now
+    fires from handle_subscription_notify() below. P13 called 8.3.6 from
+    here, which both acked something ABDM never asked to have acked and
+    left the real GRANTED/DENIED notification unacknowledged.
 
     Confirmed inbound body shape (spec 8.3.3's own documented example):
         {"subscriptionRequest": {"id": "..."}, "response": {"requestId": "..."}}
@@ -60,27 +67,17 @@ def handle_subscription_on_init(settings: Settings, payload: Any, request_id_hea
 
     log_phase(f"subscriptionRequestId {subscription_request_id} recorded for requestId {our_request_id}")
 
-    # ack_subscription_on_init() echoes ABDM's OWN REQUEST-ID header from
-    # THIS inbound callback back as response.requestId -- CONFIRMED via
-    # the proven, already-live analogous consent pattern (see
-    # subscription.py's own ack_subscription_on_init() docstring). Falls
-    # back to our own request_id if the header is somehow missing rather
-    # than skipping the ack outright -- ABDM still gets an ack either way.
-    ack_result = subscription.ack_subscription_on_init(
-        settings,
-        subscription_request_id=subscription_request_id,
-        response_request_id=request_id_header or our_request_id,
-    )
-    if not ack_result.ok:
-        log_error(f"Failed to ack subscription on-init for subscriptionRequestId={subscription_request_id}: status={ack_result.status_code} body={ack_result.body} error={ack_result.error}")
-    else:
-        log_phase(f"Acked subscription on-init for subscriptionRequestId={subscription_request_id}")
 
-
-def handle_subscription_notify(settings: Settings, payload: Any) -> None:
+def handle_subscription_notify(settings: Settings, payload: Any, request_id_header: str | None = None) -> None:
     """
     8.3.5/8.3.8/8.3.10 -- ONE shared callback URL for three outcomes
     (approve/deny/edit-result), distinguished by notification.status.
+
+    ACKNOWLEDGES VIA 8.3.6 (moved here in P19 from the on-init handler --
+    see handle_subscription_on_init()'s own docstring). Spec section 8.2's
+    sequence diagrams put the only acknowledgement of this exchange after
+    the decision callback, not after on-init. The ack echoes THIS
+    callback's own REQUEST-ID header back as response.requestId.
     Mirrors repo/server/callbacks/services/consent_hiu_notify_service.py's
     shape for an analogous multi-outcome single-URL callback: branch on
     status, update local state, no outbound ABDM call needed here (this
@@ -121,23 +118,43 @@ def handle_subscription_notify(settings: Settings, payload: Any) -> None:
     )
     if row is None:
         log_error(f"No locally tracked subscription found for subscriptionRequestId={subscription_request_id} -- notify arrived for something we never initiated or never got the on-init callback for.")
-        return
+    else:
+        log_phase(f"Subscription {subscription_request_id} status updated to {status} (subscriptionId={subscription_id})")
 
-    log_phase(f"Subscription {subscription_request_id} status updated to {status} (subscriptionId={subscription_id})")
+    # 8.3.6 -- acknowledge the DECISION, regardless of whether we could
+    # correlate it locally above. ABDM asked to be acked for this
+    # notification; failing to ack because OUR OWN bookkeeping has no
+    # matching row would leave ABDM retrying a callback we did receive.
+    ack_result = subscription.ack_subscription_notify(
+        settings,
+        subscription_request_id=subscription_request_id,
+        response_request_id=request_id_header or subscription_request_id,
+    )
+    if not ack_result.ok:
+        log_error(
+            f"Failed to ack subscription decision for subscriptionRequestId={subscription_request_id}: "
+            f"status={ack_result.status_code} error={ack_result.error}"
+        )
+    else:
+        log_phase(f"Acked subscription decision ({status}) for subscriptionRequestId={subscription_request_id}")
 
 
 def handle_subscription_care_context_notify(settings: Settings, payload: Any, request_id_header: str | None) -> None:
     """
     8.3.11 -- "new LINK/DATA available" event notify. Acks via 8.3.12,
-    then applies §8.1's own stated next step for the event's own category:
-      LINK -> "Health locker/PHR should initiate a consent request for
-               the notified care context" -- reuses the EXISTING
-               consent-init path (P8/P9's own request_self_view_consent()-
-               adjacent machinery), not a new one.
-      DATA -> "check if any existing consent request is available ...
-               and use the same to initiate the data-request" -- reuses
-               the existing 7.3.1 data-flow-request path
-               (data_flow.request_health_information()).
+    records the alert (deduped on ABDM's own event.id), then hands off to
+    locker_service for section 8.1's own next step per category:
+      LINK -> raise a consent request AS THE LOCKER for the notified care
+              contexts, matching the locker's auto-approval policy so it
+              grants without troubling the patient.
+      DATA -> reuse an existing GRANTED locker-raised consent covering
+              this care context / HI type, and only raise a new one if
+              none does.
+
+    REWIRED IN P19: this used to call data_flow.request_self_view_consent()
+    (raising consents under a HIP id as a stand-in HIU) and had no alert
+    log or dedupe at all. Both trigger helpers that did that are gone --
+    see CC_PROMPT_P19 section 5.
 
     Confirmed inbound body shape (spec 8.3.11's own documented example):
         {"event": {"id", "published", "subscriptionId", "category",
@@ -186,90 +203,54 @@ def handle_subscription_care_context_notify(settings: Settings, payload: Any, re
 
     contexts = content.get("contexts") or []
 
+    # DEDUPE (P19). Recorded AFTER the ack above and BEFORE any processing:
+    # ABDM redelivers an alert it believes went unacknowledged, so a repeat
+    # must still be acked (done) but must never raise a second consent
+    # request for the same event. record_alert_if_new() is an ON CONFLICT
+    # insert keyed on ABDM's own event.id, so even two concurrent
+    # deliveries cannot both be treated as new.
     try:
-        if category == "LINK":
-            _trigger_consent_for_link_event(patient_id, hip_id, contexts, event_id)
-        elif category == "DATA":
-            _trigger_data_request_for_data_event(settings, patient_id, hip_id, contexts, event_id)
-        else:
-            log_error(f"Care-context notify event {event_id} has unrecognized category={category!r} -- open item, no action taken.")
+        alert, is_new = locker_repository.record_alert_if_new(
+            event_id,
+            patient_id,
+            subscription_id=event.get("subscriptionId"),
+            locker_id=settings.abdm_health_locker_id or None,
+            category=category,
+            hip_id=hip_id,
+            contexts=contexts,
+            detail=payload,
+        )
     except Exception as exc:
-        # Defensive per the task spec: a failure applying §8.1's own
-        # next-step logic must not propagate past this handler (the ack
-        # above has already happened) -- logged as an open item on this
-        # specific event instead.
-        log_error(f"Failed to apply follow-up action for care-context notify event {event_id} (category={category}): {exc}")
-
-
-def _trigger_consent_for_link_event(patient_id: str, hip_id: str, contexts: list[dict[str, Any]], event_id: str) -> None:
-    """
-    §8.1: "If the subscription category is LINK - Health locker/PHR
-    should initiate a consent request for the notified care context."
-    Reuses request_self_view_consent() (data_flow.py, P8/P9) -- the
-    existing, already-proven self-view consent-init path -- rather than
-    building a second one. hi_types comes from whichever hiType(s) this
-    event's own contexts carry; falls back to data_flow.py's own broad
-    default list if the event carries none (defensive, not expected).
-    """
-    from aegle_phr.phr import data_flow
-
-    hi_types = sorted({c.get("hiType") for c in contexts if isinstance(c, dict) and c.get("hiType")})
-    if not hi_types:
-        hi_types = list(data_flow._SELF_VIEW_HI_TYPES)
-
-    from datetime import datetime, timedelta, timezone
-    now = datetime.now(timezone.utc)
-    date_range_from = (now - timedelta(days=365)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    date_range_to = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-    result = data_flow.request_self_view_consent(hi_types, date_range_from, date_range_to, patient_id)
-    if result.get("ok"):
-        log_phase(f"LINK event {event_id}: consent request initiated for patient={patient_id} hip={hip_id}")
-    else:
-        log_error(f"LINK event {event_id}: consent request initiation failed for patient={patient_id} hip={hip_id}: {result.get('error')}")
-
-
-def _trigger_data_request_for_data_event(settings: Settings, patient_id: str, hip_id: str, contexts: list[dict[str, Any]], event_id: str) -> None:
-    """
-    §8.1: "In case subscription category is DATA - then the Health
-    locker/PHR should check if any existing consent request is available
-    (hiType and duration etc.) and use the same to initiate the
-    data-request." Reuses data_flow.request_health_information() (spec
-    §7.3.1, already proven working) -- only if a locally-known, GRANTED
-    consent already covers this hip_id; otherwise logs an open item
-    rather than raising a brand-new consent request itself (that's the
-    LINK branch's job, not DATA's -- §8.1 draws this distinction
-    explicitly).
-    """
-    from server.callbacks.repository.hiu_consent_repository import get_all_hiu_consents
-    from aegle_phr.phr import data_flow
-
-    all_consents = get_all_hiu_consents()
-    matching = [
-        (consent_id, c)
-        for consent_id, c in all_consents.items()
-        if c.get("status") == "GRANTED"
-        and (c.get("consent_detail") or {}).get("patient", {}).get("id") == patient_id
-        and (c.get("consent_detail") or {}).get("hip", {}).get("id") == hip_id
-    ]
-
-    if not matching:
-        log_error(f"DATA event {event_id}: no existing GRANTED consent found locally for patient={patient_id} hip={hip_id} -- open item, cannot initiate data-request yet.")
+        log_error(f"Could not record care-context alert {event_id}: {exc}")
         return
 
-    consent_id, consent = matching[0]
-    detail = consent.get("consent_detail") or {}
-    hiu_id = (detail.get("hiu") or {}).get("id", "")
-    period = (detail.get("permission") or {}).get("dateRange") or {}
+    if not is_new:
+        log_phase(
+            f"Care-context notify event {event_id} is a REDELIVERY "
+            f"(already {alert.get('processingState')}) -- acked again, not reprocessed."
+        )
+        return
 
-    result = data_flow.request_health_information(
-        consent_id=consent_id,
-        hip_id=hip_id,
-        hiu_id=hiu_id,
-        date_range_from=period.get("from", ""),
-        date_range_to=period.get("to", ""),
-    )
-    if result.get("ok"):
-        log_phase(f"DATA event {event_id}: data-request initiated using existing consent {consent_id}")
-    else:
-        log_error(f"DATA event {event_id}: data-request initiation failed using existing consent {consent_id}: {result.get('error')}")
+    try:
+        if category == "LINK":
+            locker_service.process_link_alert(settings, patient_id, hip_id, contexts, event_id)
+        elif category == "DATA":
+            locker_service.process_data_alert(settings, patient_id, hip_id, contexts, event_id)
+        else:
+            log_error(f"Care-context notify event {event_id} has unrecognized category={category!r} -- open item, no action taken.")
+            locker_repository.update_alert_state(
+                event_id, locker_repository.ALERT_FAILED,
+                failure_reason=f"unrecognized category {category!r}",
+            )
+    except Exception as exc:
+        # Defensive per the task spec: a failure applying section 8.1's own
+        # next-step logic must not propagate past this handler (the ack
+        # above has already happened) -- recorded on the alert row instead,
+        # never swallowed.
+        log_error(f"Failed to apply follow-up action for care-context notify event {event_id} (category={category}): {exc}")
+        try:
+            locker_repository.update_alert_state(
+                event_id, locker_repository.ALERT_FAILED, failure_reason=str(exc)
+            )
+        except Exception:
+            pass

@@ -56,15 +56,34 @@ from typing import Any
 
 import requests
 
+import json
+
 from abdm_core.http import call_with_retry, generate_request_id, generate_timestamp
 from abdm_core.observability.flow_logger import log_api_call, log_error, log_phase
 from abdm_core.session import get_gateway_token
 
 from aegle_phr.phr.call_log import archive
 from aegle_phr.phr.enrollment import AbdmResult
+from aegle_phr.phr.redaction import redact
 from aegle_phr.settings import Settings
 
 _TIMEOUT_SECONDS = 30
+
+# How much of a response body goes to the PLAIN-TEXT log (the full body is
+# always archived to Postgres abdm_call_log regardless). See _execute().
+_LOG_BODY_MAX_CHARS = 1200
+
+# The locker's own purpose, CONFIRMED LIVE 2026-09-22 -- not the spec's and
+# Postman's own CAREMGT examples. Setup Locker (8.3.18) created BOTH the
+# locker's subscription AND its consent auto-approval policy with
+# {"text": "Self Requested", "code": "PATRQT"}, read back verbatim from
+# 8.3.17's own autoApprovals[0].policy.includedSources[0].purpose for
+# poojaanchaliya@sbx. Every consent the locker raises must match that
+# policy to auto-approve, so PATRQT is the default for the locker path;
+# CAREMGT stays available for a genuine third-party-HIU subscription.
+LOCKER_PURPOSE_CODE = "PATRQT"
+LOCKER_PURPOSE_TEXT = "Self Requested"
+PURPOSE_REF_URI = "www.abdm.gov.in"
 
 # The 8 confirmed hiTypes, same literal list this project uses everywhere
 # else a caller needs "every hiType" (e.g. data_flow.py's own
@@ -161,9 +180,36 @@ def _execute(
     body = _parse(response)
 
     log_api_call(description, url, response.status_code)
+    _log_response_body(description, body)
     archive(route, url, payload if payload is not None else (params or {}), response.status_code, body, duration_ms, None, ())
 
     return AbdmResult(status_code=response.status_code, body=body)
+
+
+def _log_response_body(description: str, body: Any) -> None:
+    """
+    Writes a truncated, SECRET-REDACTED response body to the plain-text log
+    (P19 section 3.1).
+
+    WHY THIS EXISTS: every call in this module used to log its status code
+    and nothing else, with the body going only to Postgres abdm_call_log.
+    That blocked diagnosis at least once -- Cowork cannot reach Postgres, so
+    "400" with no body is all anyone downstream ever saw. Everything here
+    goes through redaction.redact() first, which scrubs JWT-shaped values
+    and known secret-bearing keys, so a patient X-AUTH-TOKEN echoed back in
+    a body never reaches the log. Truncated at _LOG_BODY_MAX_CHARS because
+    8.3.15/8.3.17 can return long lists; the archive keeps the full copy.
+    """
+    try:
+        safe = redact(body, ())
+        text = safe if isinstance(safe, str) else json.dumps(safe, default=str)
+    except Exception as exc:  # never let logging break a real call
+        log_error(f"{description}: could not render response body for logging ({exc})")
+        return
+
+    if len(text) > _LOG_BODY_MAX_CHARS:
+        text = f"{text[:_LOG_BODY_MAX_CHARS]}... [truncated, full body in abdm_call_log]"
+    log_phase(f"{description} response body: {text}")
 
 
 # =============================================================================
@@ -212,19 +258,28 @@ def initiate_subscription_request(
 
 
 # =============================================================================
-# 8.3.6 -- Ack HIU received on-init callback  --  POST .../hiu/on-notify
+# 8.3.6 -- Ack the DECISION callback (hiu/notify)  --  POST .../hiu/on-notify
 # =============================================================================
 
-def ack_subscription_on_init(settings: Settings, subscription_request_id: str, response_request_id: str) -> AbdmResult:
+def ack_subscription_notify(settings: Settings, subscription_request_id: str, response_request_id: str) -> AbdmResult:
     """
-    REQUESTER call -- no X-AUTH-TOKEN. `response_request_id` is ABDM's own
-    REQUEST-ID header value from the INBOUND 8.3.3 callback being
-    acknowledged, echoed back verbatim -- CONFIRMED via the proven,
-    already-live analogous consent pattern (repo/server/hiu_consent.py's
-    send_consent_hiu_on_notify(): "request_id ... echoed back as
-    response.requestId, matching the ack convention used elsewhere in
-    this codebase") -- NOT a freshly-generated id, and NOT the original
-    8.3.2 init call's own REQUEST-ID.
+    REQUESTER call -- no X-AUTH-TOKEN.
+
+    CORRECTED IN P19 (was `ack_subscription_on_init`, called from the
+    on-init handler). 8.3.6 acknowledges the DECISION callback --
+    hiu/notify, carrying GRANTED / DENIED / edited (8.3.5 / 8.3.8 /
+    8.3.10) -- NOT the 8.3.3 on-init callback. Spec section 8.2's own
+    sequence diagrams show init -> on-init with NO acknowledgement after
+    on-init; the only ack in that exchange follows the decision. P13 wired
+    it to on-init, which meant a real GRANTED notification was never
+    acknowledged and an on-init was acknowledged that ABDM never asked to
+    have acknowledged.
+
+    `response_request_id` is ABDM's own REQUEST-ID header value from the
+    INBOUND hiu/notify callback being acknowledged, echoed back verbatim --
+    same convention as repo/server/hiu_consent.py's own
+    send_consent_hiu_on_notify(). NOT a freshly-generated id, and NOT the
+    original 8.3.2 init call's own REQUEST-ID.
     """
     url = f"{settings.abdm_hiecm_base_url.rstrip('/')}/subscription-requests/v3/hiu/on-notify"
     payload = {
@@ -232,8 +287,8 @@ def ack_subscription_on_init(settings: Settings, subscription_request_id: str, r
         "response": {"requestId": response_request_id},
     }
     headers = _requester_headers(settings.abdm_x_cm_id)
-    log_phase(f"Acking subscription on-init for subscriptionRequestId={subscription_request_id}")
-    return _execute("/phr/subscription/ack-on-init", "POST", url, headers, payload, "PHR subscription ack on-init")
+    log_phase(f"Acking subscription decision notify for subscriptionRequestId={subscription_request_id}")
+    return _execute("/phr/subscription/ack-notify", "POST", url, headers, payload, "PHR subscription ack decision notify")
 
 
 # =============================================================================

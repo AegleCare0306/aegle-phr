@@ -194,7 +194,6 @@ import {
   approveConsentRequest,
   autoApprove,
   denyConsentRequest,
-  discoverSelfViewConsents,
   disableAutoApprove,
   enableAutoApprove,
   getAllConsentArtefacts,
@@ -764,7 +763,6 @@ export function ConsentScreen(): JSX.Element {
   const [autoApproveConsentId, setAutoApproveConsentId] = useState("");
   const [autoApproveStateResult, setAutoApproveStateResult] = useState<ApiResult<AbdmPassthrough> | null>(null);
   /** P13 -- discover-self-view-consents' own last result (see data_flow.py's own discover_self_view_consents() docstring). */
-  const [discoverResult, setDiscoverResult] = useState<ApiResult<AbdmPassthrough> | null>(null);
   /** P8 item 3 -- last consentId seen via a Level-3 artefact view, prefilled into Auto-Approve's own manual field below when opened, since a bare unlabeled textbox is a bad UX for a real, standing spec gap (§6.13's response never documents how a caller learns a consentId at all). */
   const [lastViewedConsentId, setLastViewedConsentId] = useState("");
 
@@ -1389,25 +1387,14 @@ export function ConsentScreen(): JSX.Element {
         )}
       </fieldset>
 
-      {/* --- Discover Self-View Grants (P13) ------------------------------ */}
-      <fieldset className="step" disabled={busy}>
-        <legend><RefreshCw size={15} aria-hidden="true" /> Discover Self-View Grants</legend>
-        <p className="muted">
-          ABDM appears to grant self-view (PATRQT) access on its own, independent of the Auto-Approve
-          policy above — confirmed live under hiu.id <code>&quot;sbx_001&quot;</code>, requester{" "}
-          <code>&quot;SELF&quot;</code>. This checks for any such grants and registers each new one
-          locally so &quot;Pull Records&quot; can actually use it. Safe to run repeatedly — already-known
-          grants are skipped.
-        </p>
-        <Button
-          size="sm"
-          icon={RefreshCw}
-          onClick={() => void run(async () => setDiscoverResult(await discoverSelfViewConsents({ xToken: sessionToken })))}
-        >
-          Discover Self-View Grants
-        </Button>
-        <RawBody label="discover-self-view-consents" result={discoverResult} />
-      </fieldset>
+      {/*
+        P19 removed the "Discover Self-View Grants" panel that used to sit
+        here. It looked for consents ABDM had granted to a DIFFERENT app
+        (its own sandbox PHR) and registered them locally so this app could
+        pull data under them -- which meant reading another registration's
+        grants. Records now reach a patient only through our own Health
+        Locker's consents; see the Subscriptions screen.
+      */}
     </section>
   );
 }

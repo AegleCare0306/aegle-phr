@@ -4,20 +4,22 @@
  * ConsentScreen.tsx's own Requests tab follows, and this screen mirrors
  * that one's picker/RawBody/run() patterns rather than inventing new ones.
  *
- * THREE SECTIONS, matching CC_PROMPT_P13_subscription_flow_full_build.md's
- * own UI requirements list:
- *   1. Self-Subscription -- the auto-approve-shaped case (8.3.2 with
- *      hiu.id=CLIENT_ID). Also fires automatically once per session from
- *      HomeScreen.tsx's own login effect, alongside ensureSelfViewAutoApprove()
- *      -- the button here is for manual re-trigger/visibility, not the
- *      only way it happens.
+ * SECTIONS (rebuilt in P19):
+ *   1. Your records locker -- the patient-facing opt-in. Allow runs Setup
+ *      Locker (8.3.18), which creates the already-granted subscription AND
+ *      its consent auto-approval policy in one call; "Not now" is recorded
+ *      so the automation never silently re-subscribes them. Replaces P13's
+ *      "Self-Subscription" panel, which raised 8.3.2 under hiu.id=CLIENT_ID.
  *   2. Subscription Requests -- list (8.3.1) with Approve/Deny/Edit
  *      (8.3.4/8.3.7/8.3.9) for whichever ones need patient action.
- *   3. Health Lockers -- list (8.3.16), detail (8.3.17), Setup Locker
- *      (8.3.18) with the X-LOCKER-ID surfaced for debugging (R2 in the
- *      task spec -- whether CLIENT_ID is genuinely registered as a
- *      HEALTH_LOCKER is unconfirmed, resolved by trying it live, not by
- *      guessing silently).
+ *   3. Health Lockers -- list (8.3.16) and detail (8.3.17). The old
+ *      free-text X-LOCKER-ID box is gone: the locker id comes from
+ *      ABDM_HEALTH_LOCKER_ID, confirmed live as IN2410002590 (registered
+ *      HEALTH_LOCKER + PHR), not typed in or guessed.
+ *
+ * The patient's lists include OTHER apps' subscriptions -- they are the
+ * patient's own, so they are shown, labelled by hiu.name/requesterType.
+ * This app's automation never acts on them.
  *
  * hiTypes ARE NOT part of 8.3.1's own response shape (spec's own example:
  * patient/purpose/hiu/hips/categories/period, no hiTypes at all) -- so
@@ -32,7 +34,6 @@ import {
   Check,
   Edit3,
   Lock,
-  PlusCircle,
   RefreshCw,
   Send,
   ShieldCheck,
@@ -43,13 +44,16 @@ import {
   approveSubscriptionRequest,
   denySubscriptionRequest,
   editSubscription,
-  ensureSelfSubscription,
   getAllSubscriptionRequests,
   getLocalSubscriptions,
   getLockerDetails,
   getPatientSubscribedLockers,
-  setupLocker,
+  getLockerStatus,
+  setupPatientLocker,
+  declineLocker,
+  runLockerInitialSync,
 } from "../api/endpoints";
+import type { LockerStatus } from "../api/endpoints";
 import type { AbdmPassthrough, ApiResult } from "../api/types";
 import { RawBody } from "../components/RawBody";
 import { Badge } from "../components/ui/Badge";
@@ -161,8 +165,37 @@ export function SubscriptionsScreen(): JSX.Element {
     }
   };
 
-  // --- Self-Subscription -----------------------------------------------
-  const [ensureResult, setEnsureResult] = useState<ApiResult<AbdmPassthrough> | null>(null);
+  // --- Our Health Locker (P19) -------------------------------------------
+  // Replaces P13's "Self-Subscription" panel, which raised 8.3.2 with
+  // hiu.id=CLIENT_ID. Records now arrive only via the locker.
+  const [lockerStatusResult, setLockerStatusResult] = useState<ApiResult<LockerStatus> | null>(null);
+  const lockerStatus = lockerStatusResult?.data ?? null;
+  const [setupResult, setSetupResult] = useState<ApiResult<AbdmPassthrough> | null>(null);
+  const [syncResult, setSyncResult] = useState<ApiResult<AbdmPassthrough> | null>(null);
+
+  const refreshLockerStatus = (): void => {
+    void run(async () => setLockerStatusResult(await getLockerStatus({ xToken: sessionToken, patientAbhaAddress: sessionAddress })));
+  };
+
+  const allowLocker = (): void => {
+    void run(async () => {
+      const result = await setupPatientLocker({ xToken: sessionToken, patientAbhaAddress: sessionAddress });
+      setSetupResult(result);
+      if (result.data?.ok === true) refreshLockerStatus();
+    });
+  };
+
+  const notNow = (): void => {
+    void run(async () => {
+      await declineLocker({ patientAbhaAddress: sessionAddress });
+      refreshLockerStatus();
+    });
+  };
+
+  const backfill = (): void => {
+    void run(async () => setSyncResult(await runLockerInitialSync({ xToken: sessionToken, patientAbhaAddress: sessionAddress })));
+  };
+
   const [localResult, setLocalResult] = useState<ApiResult<AbdmPassthrough> | null>(null);
   const localSubscriptions = Array.isArray((localResult?.data?.body as { subscriptions?: unknown } | undefined)?.subscriptions)
     ? ((localResult?.data?.body as { subscriptions: Record<string, unknown>[] }).subscriptions)
@@ -247,15 +280,6 @@ export function SubscriptionsScreen(): JSX.Element {
     void run(async () => setLockerDetailResult(await getLockerDetails({ xToken: sessionToken, lockerId })));
   };
 
-  const [setupLockerId, setSetupLockerId] = useState("");
-  const [setupLockerResult, setSetupLockerResult] = useState<ApiResult<AbdmPassthrough> | null>(null);
-  const submitSetupLocker = (): void => {
-    if (setupLockerId === "") return;
-    void run(async () => {
-      const result = await setupLocker({ xToken: sessionToken, lockerId: setupLockerId });
-      setSetupLockerResult(result);
-    });
-  };
 
   if (sessionToken === "") {
     return (
@@ -270,17 +294,57 @@ export function SubscriptionsScreen(): JSX.Element {
     <section className="panel">
       <PageHeader icon={Bell} title="Subscriptions" description="Spec §8 -- get notified when new records show up, without checking manually." />
 
-      {/* --- Self-Subscription --------------------------------------- */}
+      {/* --- Our Health Locker (P19) --------------------------------- */}
       <Card as="fieldset" disabled={busy} padding="md" style={{ marginBottom: "var(--space-4)" }}>
-        <CardTitle icon={ShieldCheck}>Self-Subscription</CardTitle>
-        <p className="muted">
-          Also fires automatically once per login (same as Consent Auto-Approve) -- this button is for
-          manual re-trigger/visibility, not the only way it happens.
-        </p>
-        <Button size="sm" icon={Send} onClick={() => void run(async () => setEnsureResult(await ensureSelfSubscription({ patientAbhaAddress: sessionAddress })))}>
-          Ensure Self-Subscription
-        </Button>
-        <RawBody label="ensure-self-subscription" result={ensureResult} />
+        <CardTitle icon={Lock}>Your records locker</CardTitle>
+
+        {lockerStatus === null ? (
+          <p className="muted">
+            Aegle Urgent Care can collect your records automatically as they are created, so you do
+            not have to fetch anything by hand. Check the status to see whether it is switched on.
+          </p>
+        ) : lockerStatus.subscriptionUsable ? (
+          <>
+            <p>
+              <Badge tone="success">On</Badge>{" "}
+              Your records are being collected automatically.
+            </p>
+            <p className="muted">
+              New visits are added on their own. Nothing here needs your attention.
+            </p>
+          </>
+        ) : lockerStatus.needsOptIn ? (
+          <>
+            <p className="muted">
+              Turn this on and Aegle Urgent Care will collect your health records for you as
+              hospitals add them — so they are already here when you open the app. You can switch it
+              off at any time.
+            </p>
+            <Button size="sm" icon={Check} onClick={allowLocker}>Allow</Button>{" "}
+            <Button size="sm" variant="ghost" icon={X} onClick={notNow}>Not now</Button>
+          </>
+        ) : (
+          <p>
+            <Badge tone="neutral">Off</Badge>{" "}
+            <span className="muted">
+              You chose not to collect records automatically. You can turn it back on here whenever
+              you like.
+            </span>{" "}
+            <Button size="sm" icon={Check} onClick={allowLocker}>Turn on</Button>
+          </p>
+        )}
+
+        <Button size="sm" icon={RefreshCw} onClick={refreshLockerStatus}>Check status</Button>{" "}
+        {lockerStatus?.subscriptionUsable === true && (
+          <Button size="sm" variant="ghost" icon={Send} onClick={backfill}>Fetch older records</Button>
+        )}
+        <RawBody label="locker/setup" result={setupResult} />
+        <RawBody label="locker/initial-sync" result={syncResult} />
+      </Card>
+
+      {/* --- Local subscription bookkeeping (debug) -------------------- */}
+      <Card as="fieldset" disabled={busy} padding="md" style={{ marginBottom: "var(--space-4)" }}>
+        <CardTitle icon={ShieldCheck}>Local records (debug)</CardTitle>
         <Button size="sm" icon={RefreshCw} onClick={refreshLocal}>Refresh local status</Button>
         <RawBody label="get-local" result={localResult} />
         {localSubscriptions !== null && (
@@ -380,17 +444,13 @@ export function SubscriptionsScreen(): JSX.Element {
         )}
         <RawBody label="lockers/get-one" result={lockerDetailResult} />
 
-        <p className="muted">
-          R2 (open item): whether this bridge is genuinely registered as a HEALTH_LOCKER type is
-          unconfirmed. X-LOCKER-ID is caller-supplied here, not guessed by the backend -- try your
-          bridge id (SBXID_046112) first, and check the raw response below either way.
-        </p>
-        <label className="row">
-          <span>X-LOCKER-ID</span>
-          <input type="text" value={setupLockerId} placeholder="SBXID_046112" onChange={(event) => setSetupLockerId(event.target.value)} />
-        </label>
-        <Button size="sm" icon={PlusCircle} disabled={setupLockerId === ""} onClick={submitSetupLocker}>Setup Locker</Button>
-        <RawBody label="setup-locker" result={setupLockerResult} />
+        {/*
+          P19 removed the free-text X-LOCKER-ID field that used to sit here.
+          The locker id is no longer something a user types or the UI
+          guesses -- it comes from ABDM_HEALTH_LOCKER_ID (confirmed live as
+          IN2410002590, registered HEALTH_LOCKER + PHR). Setting the locker
+          up is the Allow button in "Your records locker" above.
+        */}
       </Card>
     </section>
   );

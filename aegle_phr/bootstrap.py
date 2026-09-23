@@ -29,6 +29,7 @@ import threading
 import urllib3.util.connection as _urllib3_connection
 
 from abdm_core.config import GatewayConfig, configure
+from abdm_core.observability.flow_logger import log_error, log_phase
 from abdm_core.paths import StoragePaths, configure_paths
 
 from aegle_phr.db import init_engine, reset_engine
@@ -109,6 +110,7 @@ def bootstrap(settings: Settings) -> None:
             client_secret=settings.abdm_client_secret,
             gateway_base_url=settings.abdm_gateway_base_url,
             x_cm_id=settings.abdm_x_cm_id,
+            extra_allowed_azp=frozenset(settings.abdm_extra_allowed_azp),
         ))
 
         configure_paths(StoragePaths(
@@ -116,36 +118,36 @@ def bootstrap(settings: Settings) -> None:
             storage_root=settings.storage_root,
         ))
 
+        # P20 -- ONE engine, this app's own. The block that used to sit
+        # here additionally initialised repo/'s engine, because
+        # data_flow.py reached straight into three of repo/'s repository
+        # modules and they needed a live engine of their own. Those reaches
+        # are gone: consent artefacts, pending sessions and fetched record
+        # content now live in this app's own locker_* tables (see
+        # aegle_phr/phr/locker_hiu_repository.py), so there is no second
+        # engine to initialise and no ImportError branch to guard.
+        #
+        # This is what makes standalone mode real rather than nominal. The
+        # mounted deployment is unaffected: repo/server/main.py still
+        # initialises its own engine at its own startup, exactly as before.
         init_engine(settings.database_url)
 
-        # P17 -- aegle_phr/phr/data_flow.py calls straight into three of
-        # repo/'s own repository modules (hiu_consent_repository,
-        # hiu_health_information_repository,
-        # pending_health_information_request_repository), not just files
-        # under server/ -- fine in the real mounted deployment (same
-        # process, repo/'s own engine already initialised by
-        # repo/server/main.py's own startup, P16) but this package ALSO
-        # ships its own standalone dev server (aegle_phr/app.py, "FOR
-        # SOLO DEVELOPMENT ONLY"), whose bootstrap path never touched
-        # repo/'s engine at all -- data_flow.py's own error message
-        # already documents this combination isn't really supported, but
-        # the failure should be an explicit, early one, not whatever
-        # RuntimeError shape server/db.py's get_engine() raises the first
-        # time some standalone-mode request happens to reach it. Wrapped
-        # in try/except ImportError like every other place aegle_phr
-        # reaches into repo/'s package -- this package must still start
-        # up fine on a machine that doesn't have repo/'s server package
-        # installed at all. init_engine() is idempotent (P16) -- safe
-        # even though the mounted deployment calls it separately too;
-        # the two code paths never run in the same process.
+        # P20 -- re-trust the bridges of any data request still awaiting
+        # its push. The trust set (see aegle_phr/phr/hip_trust.py) lives
+        # in process memory, so without this a restart mid-transfer would
+        # reject the HIP's push for a request we ourselves made moments
+        # earlier. A pure DB read: startup must not depend on ABDM being
+        # reachable, and must not fail if this table does not exist yet
+        # (a host that has not run the migrations).
         try:
-            from server.config import DATABASE_URL as _repo_database_url
-            from server.db import init_engine as _repo_init_engine
+            from aegle_phr.phr import hip_trust
+            from aegle_phr.phr import locker_hiu_repository
 
-            _repo_init_engine(_repo_database_url)
-        except ImportError:
-            pass  # repo/'s server package isn't installed/importable -- standalone mode's
-                  # own per-call try/except ImportError blocks already handle this cleanly.
+            warmed = hip_trust.warm_trusted_bridges(locker_hiu_repository.pending_hip_bridge_ids())
+            if warmed:
+                log_phase(f"Re-trusted {warmed} bridge(s) with data transfers still in flight")
+        except Exception as exc:
+            log_error(f"Could not re-trust in-flight bridges at startup: {type(exc).__name__}: {exc}")
 
         _bootstrapped = True
 

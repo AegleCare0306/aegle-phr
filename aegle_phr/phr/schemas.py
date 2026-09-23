@@ -598,32 +598,75 @@ class RequestHealthInformationBody(BaseModel):
     dateRangeTo: str = Field(min_length=1)
 
 
-class RequestSelfViewConsentBody(BaseModel):
-    """P9 -- raises a dedicated, PATRQT-purposed self-view consent request. See data_flow.py's own request_self_view_consent() docstring."""
-
-    hiTypes: list[str] = Field(min_length=1)
-    dateRangeFrom: str = Field(min_length=1)
-    dateRangeTo: str = Field(min_length=1)
-    patientAbhaAddress: str = Field(min_length=1)
-
-
 class TriggerConsentFetchBody(BaseModel):
-    """P12 -- explicitly triggers repo/'s own fetch_consent() for a GRANTED consent. See data_flow.py's own trigger_consent_fetch() docstring for why this exists."""
+    """Manual nudge for repo/'s own fetch_consent() on a GRANTED consent. Kept pending live verification that locker consents fetch on their own -- see data_flow.py's own banner."""
 
     consentId: str = Field(min_length=1)
     hiuId: str = Field(min_length=1)
 
 
-class EnsureSelfViewAutoApproveBody(BaseModel):
-    """P11 -- sets up ABDM's Consent Auto-Approval standing policy for self-view. See data_flow.py's own ensure_self_view_auto_approve() docstring."""
+# ---------------------------------------------------------------------------
+# P19 -- Health Locker. The only route by which a patient's records reach
+# this app; see aegle_phr/phr/locker_service.py's own banner. P19 removed
+# RequestSelfViewConsentBody, EnsureSelfViewAutoApproveBody,
+# DiscoverSelfViewConsentsBody and EnsureSelfSubscriptionBody along with
+# the functions and routes behind them.
+# ---------------------------------------------------------------------------
+
+class LockerStatusBody(BaseModel):
+    """Is this patient's locker set up and usable? Read-only; drives the opt-in screen."""
 
     xToken: str = Field(min_length=1)
+    patientAbhaAddress: str = Field(min_length=1)
 
 
-class DiscoverSelfViewConsentsBody(BaseModel):
-    """P13 -- finds self-view consents ABDM already granted natively and registers them with repo/'s own hiu_consent_repository. See data_flow.py's own discover_self_view_consents() docstring."""
+class LockerSetupBody(BaseModel):
+    """8.3.18 Setup Locker. Only ever called after the patient presses Allow."""
 
     xToken: str = Field(min_length=1)
+    patientAbhaAddress: str = Field(min_length=1)
+
+
+class LockerDeclineBody(BaseModel):
+    """
+    Records a 'Not now' (optedOut=False) or a deliberate opt-out after
+    previously allowing (optedOut=True). Either way the automation stops
+    asking and never silently re-subscribes -- see PatientLocker's own
+    opt_in_state docstring.
+    """
+
+    patientAbhaAddress: str = Field(min_length=1)
+    optedOut: bool = False
+
+
+class LockerRecordsBody(BaseModel):
+    """
+    Reads what the locker currently holds for this patient.
+
+    xToken is OPTIONAL and is used for one thing only: if the one-off
+    backfill has never run, it is what lets the locker read the patient's
+    linked records to start it. Omitting it still returns everything
+    already held -- the read itself needs no patient session, because the
+    records are ours to serve.
+    """
+
+    patientAbhaAddress: str = Field(min_length=1)
+    xToken: str = ""
+
+
+class LockerInitialSyncBody(BaseModel):
+    """One-off backfill of care contexts linked before the subscription existed."""
+
+    xToken: str = Field(min_length=1)
+    patientAbhaAddress: str = Field(min_length=1)
+    force: bool = False
+
+
+class LockerAlertsBody(BaseModel):
+    """This patient's locker alert log and how far each event got."""
+
+    patientAbhaAddress: str = Field(min_length=1)
+    limit: int = 50
 
 
 # ---------------------------------------------------------------------------
@@ -632,12 +675,6 @@ class DiscoverSelfViewConsentsBody(BaseModel):
 # "PHR&HIECM" Postman collection). Every field name below matches that
 # module's own function signatures exactly.
 # ---------------------------------------------------------------------------
-
-class EnsureSelfSubscriptionBody(BaseModel):
-    """P13 -- sets up the subscription-equivalent of consent auto-approve (8.3.2, hiu.id=CLIENT_ID). See data_flow.py's own ensure_self_subscription() docstring. No xToken -- this is a REQUESTER-role call, confirmed via Postman to need no patient session token."""
-
-    patientAbhaAddress: str = Field(min_length=1)
-
 
 class GetAllSubscriptionRequestsBody(BaseModel):
     """8.3.1."""
@@ -799,4 +836,9 @@ class UilLinkConfirmBody(BaseModel):
     token: int
     linkRefNumber: str = Field(min_length=1)
 
-    patientAbhaAddress: str = Field(min_length=1)
+    # REMOVED 2026-09-23: a stray REQUIRED `patientAbhaAddress` sat here,
+    # appended after the docstring and read by nothing -- the route uses
+    # body.abhaAddress. Being required, it rejected 422 every link-confirm
+    # that sent the five documented fields, including the frontend's own
+    # (testui's UilLinkConfirmBody has never carried it). It made 10.3.9
+    # uncallable from the UI. Found live on the first real confirm.

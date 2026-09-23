@@ -16,13 +16,14 @@ Everything here obeys the mountability rules:
   - every handler a plain `def` (see aegle_phr/db.py for why)
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 
 from abdm_core.http import generate_request_id
 
 from aegle_phr.access import api_key_dependency
 from aegle_phr.callbacks.router import build_callback_router
 from aegle_phr.db import check_connection
+from aegle_phr.phr import locker_hiu_repository, locker_repository, locker_service, retention
 from aegle_phr.phr import abha_address_creation, abha_card, aadhaar_enrollment, consent, data_flow, email_verification, enrollment, links, login, mobile_linking, profile, profile_link, providers, subscription, uil
 from aegle_phr.phr.subscription_repository import get_all_for_patient as get_all_local_subscriptions_for_patient
 from aegle_phr.phr.uil_repository import get_by_request_id as get_uil_request_by_id, save_new_request as save_new_uil_request
@@ -64,12 +65,8 @@ from aegle_phr.phr.schemas import (
     RequestMobileLinkOtpBody,
     RequestOtpBody,
     RequestHealthInformationBody,
-    RequestSelfViewConsentBody,
     RequestUpdateEmailOtpBody,
     TriggerConsentFetchBody,
-    EnsureSelfViewAutoApproveBody,
-    DiscoverSelfViewConsentsBody,
-    EnsureSelfSubscriptionBody,
     GetAllSubscriptionRequestsBody,
     ApproveSubscriptionRequestBody,
     DenySubscriptionRequestBody,
@@ -80,6 +77,12 @@ from aegle_phr.phr.schemas import (
     GetPatientSubscribedLockersBody,
     GetLockerDetailsBody,
     SetupLockerBody,
+    LockerStatusBody,
+    LockerSetupBody,
+    LockerDeclineBody,
+    LockerInitialSyncBody,
+    LockerAlertsBody,
+    LockerRecordsBody,
     SetSubscriptionStateBody,
     GetLocalSubscriptionsBody,
     RequestUpdateMobileOtpBody,
@@ -456,59 +459,137 @@ def build_app_api_router(settings: Settings) -> APIRouter:
     def providers_govt_programs(body: GetGovtProgramsBody) -> dict:  # noqa: ARG001 -- body has no fields, kept for POST-body symmetry with every other route here
         return _passthrough(providers.get_govt_programs(settings))  # type: ignore[arg-type]
 
-    # -- Data Flow (spec §7) -- thin wrapper over repo/'s own working M3
-    # Block 2 pipeline. See aegle_phr/phr/data_flow.py's own banner: no
-    # ABDM call is made directly by MOST of this module's own functions
-    # (they return their own {ok, status, body, error} envelope already,
-    # not an AbdmResult, so these five routes do NOT go through
-    # _passthrough()) -- ensure_self_view_auto_approve() is the one
-    # exception, since it calls aegle_phr/phr/consent.py's own
-    # auto_approve() (a real, direct ABDM call), but it already normalizes
-    # that AbdmResult into the same envelope shape itself, so the route
-    # here still doesn't need _passthrough().
+    # -- Data Flow (spec §7). P20: these no longer wrap repo/ -- the whole
+    # section 6/7 chain is this app's own now (aegle_phr/phr/hiu_client.py
+    # outbound, aegle_phr/callbacks/hiu_services.py inbound). They return
+    # their own {ok, status, body, error} envelope, not an AbdmResult, so
+    # these routes do NOT go through _passthrough().
+    #
+    # MANUAL EQUIVALENTS, NOT THE NORMAL PATH: real data reaches a patient
+    # because their Health Locker drives consent -> fetch -> data request
+    # automatically off an 8.3.11 alert. These exist for testing and for a
+    # complete API surface.
+    #
+    # P19 removed three routes that used to live here -- self-view-consent,
+    # ensure-self-view-auto-approve and discover-self-view-consents -- along
+    # with the functions behind them. Records now reach a patient only via
+    # the Health Locker (see the locker routes further below).
 
-    @router.post("/phr/data-flow/request", summary="Health Information Request (§7.3.1) -- thin wrapper over repo/'s own hiu_health_information.py")
+    @router.post("/phr/data-flow/request", summary="Health Information Request (§7.3.1). Checks the consent artefact we hold before spending a round trip.")
     def data_flow_request(body: RequestHealthInformationBody) -> dict:
         return data_flow.request_health_information(
-            body.consentId, body.hipId, body.hiuId, body.dateRangeFrom, body.dateRangeTo,
+            settings, body.consentId, body.hipId, body.hiuId, body.dateRangeFrom, body.dateRangeTo,
         )
 
-    @router.get("/phr/data-flow/status/{request_id}", summary="Poll repo/'s own local correlation state for a Health Information Request -- see data_flow.py")
+    @router.get("/phr/data-flow/status/{request_id}", summary="Poll this app's own correlation state for a Health Information Request -- see data_flow.py")
     def data_flow_status(request_id: str) -> dict:
         return data_flow.get_health_information_status(request_id)
 
-    @router.post("/phr/data-flow/self-view-consent", summary="P9 -- raise a dedicated PATRQT self-view consent request -- see data_flow.py's own request_self_view_consent()")
-    def data_flow_self_view_consent(body: RequestSelfViewConsentBody) -> dict:
-        return data_flow.request_self_view_consent(
-            body.hiTypes, body.dateRangeFrom, body.dateRangeTo, body.patientAbhaAddress,
-        )
-
-    @router.post("/phr/data-flow/trigger-consent-fetch", summary="P12 -- explicitly trigger repo/'s own fetch_consent() -- see data_flow.py's own trigger_consent_fetch()")
+    @router.post("/phr/data-flow/trigger-consent-fetch", summary="Manual §6 consent fetch, for a GRANTED consent whose notify callback never arrived -- see data_flow.py's own banner")
     def data_flow_trigger_consent_fetch(body: TriggerConsentFetchBody) -> dict:
-        return data_flow.trigger_consent_fetch(body.consentId, body.hiuId)
+        return data_flow.trigger_consent_fetch(settings, body.consentId, body.hiuId)
 
-    @router.post("/phr/data-flow/ensure-self-view-auto-approve", summary="P11 -- set up ABDM's Consent Auto-Approval policy for self-view, once per patient -- see data_flow.py's own ensure_self_view_auto_approve()")
-    def data_flow_ensure_self_view_auto_approve(body: EnsureSelfViewAutoApproveBody) -> dict:
-        return data_flow.ensure_self_view_auto_approve(settings, body.xToken)
+    # -- Health Locker (P19) -- the ONLY route by which a patient's records
+    # reach this app. See aegle_phr/phr/locker_service.py's own banner.
+    # These return their own {ok, ...} envelopes, not AbdmResult, so they
+    # don't go through _passthrough().
 
-    @router.post("/phr/data-flow/discover-self-view-consents", summary="P13 -- find self-view consents ABDM already granted natively and register them with repo/'s own hiu_consent_repository -- see data_flow.py's own discover_self_view_consents()")
-    def data_flow_discover_self_view_consents(body: DiscoverSelfViewConsentsBody) -> dict:
-        return data_flow.discover_self_view_consents(settings, body.xToken)
+    @router.post("/phr/locker/status", summary="P19 -- is this patient's locker set up and usable? Drives the opt-in screen. Read-only, creates nothing.")
+    def locker_status(body: LockerStatusBody) -> dict:
+        return locker_service.get_locker_status(settings, body.xToken, body.patientAbhaAddress)
+
+    @router.post("/phr/locker/setup", summary="P19 -- 8.3.18 Setup Locker, run only after the patient presses Allow on the opt-in screen. Creates the granted subscription AND its auto-approval policy in one call.")
+    def locker_setup(body: LockerSetupBody) -> dict:
+        return locker_service.setup_locker_for_patient(settings, body.xToken, body.patientAbhaAddress)
+
+    @router.post("/phr/locker/decline", summary="P19 -- records that the patient said 'Not now' (or opted out), so the automation never silently re-subscribes them.")
+    def locker_decline(body: LockerDeclineBody) -> dict:
+        state = (
+            locker_repository.OPT_IN_OPTED_OUT if body.optedOut
+            else locker_repository.OPT_IN_DECLINED
+        )
+        row = locker_repository.set_opt_in(
+            body.patientAbhaAddress, settings.abdm_health_locker_id, state,
+        )
+        # P20 -- withdrawing permission erases what we hold. Run for BOTH
+        # states, not just OPTED_OUT: "Not now" from someone who never
+        # allowed is a no-op (nothing was collected), and reasoning about
+        # which path can have data behind it is exactly the kind of
+        # cleverness that leaves records behind after a withdrawal.
+        erasure = retention.erase_for_patient(
+            body.patientAbhaAddress, settings.abdm_health_locker_id, f"patient opt-in set to {state}",
+        )
+        return {"ok": True, "status": 200, "body": row, "erasure": erasure, "error": None}
+
+    @router.post("/phr/locker/initial-sync", summary="P19 -- one-off backfill of care contexts linked BEFORE the subscription existed (alerts only cover what is linked after).")
+    def locker_initial_sync(body: LockerInitialSyncBody) -> dict:
+        return locker_service.run_initial_sync(settings, body.xToken, body.patientAbhaAddress, force=body.force)
+
+    @router.post("/phr/locker/records", summary="P20 -- everything the locker currently holds for this patient, read from local storage. No ABDM call. Sweeps lapsed consents first, and starts the one-off backfill if it has never run.")
+    def locker_records(body: LockerRecordsBody, background: BackgroundTasks) -> dict:
+        """
+        THE LOGIN READ. A locker is entitled to store records for the life
+        of the consent behind them, so this is a database read rather than
+        a round trip per hospital -- which is the entire practical benefit
+        of being a locker rather than a proxy.
+
+        SWEEPS BEFORE IT SERVES. Reading is the moment we would otherwise
+        hand over data, so a consent whose retention deadline has passed is
+        erased first. That ordering matters: it makes it structurally
+        impossible to serve a record we are no longer entitled to hold,
+        even once, even if no sweep has run for months.
+
+        STARTS THE BACKFILL, DOES NOT WAIT FOR IT. 8.3.11 alerts only cover
+        care contexts linked AFTER the subscription existed, so a patient's
+        existing history needs one backfill pass. It is a real ABDM round
+        trip per hospital (5-10s observed), so it runs in the background
+        and this returns immediately with whatever is already held plus
+        initialSyncState -- the caller polls rather than blocking a login
+        on it.
+        """
+        patient_id = body.patientAbhaAddress
+        locker_id = settings.abdm_health_locker_id
+
+        retention.sweep_expired(patient_id=patient_id)
+
+        local = locker_repository.get_patient_locker(patient_id, locker_id)
+        sync_state = (local or {}).get("initialSyncState")
+        opted_in = (local or {}).get("optInState") == locker_repository.OPT_IN_ALLOWED
+
+        if opted_in and body.xToken and sync_state == locker_repository.SYNC_NOT_STARTED:
+            background.add_task(
+                locker_service.run_initial_sync, settings, body.xToken, patient_id,
+            )
+            sync_state = locker_repository.SYNC_RUNNING
+
+        records = locker_hiu_repository.get_records_for_patient(patient_id)
+        return {
+            "ok": True,
+            "status": 200,
+            "body": {
+                "lockerId": locker_id,
+                "optInState": (local or {}).get("optInState"),
+                "initialSyncState": sync_state,
+                "count": len(records),
+                "records": records,
+            },
+            "error": None,
+        }
+
+    @router.post("/phr/locker/alerts", summary="P19 -- this patient's locker alert log: every LINK/DATA event and how far it got (received -> consent -> data).")
+    def locker_alerts(body: LockerAlertsBody) -> dict:
+        return {"ok": True, "status": 200,
+                "body": {"alerts": locker_repository.get_alerts_for_patient(body.patientAbhaAddress, body.limit)},
+                "error": None}
 
     # -- Subscription Flow (spec §8) -- see aegle_phr/phr/subscription.py's
-    # own module banner for the full URL/body provenance, and
-    # CC_PROMPT_P13_subscription_flow_full_build.md for the task spec this
-    # implements. ensure_self_subscription() (data_flow.py) is the one
-    # exception that doesn't go through _passthrough() (it already
-    # normalizes its own AbdmResult into the same envelope shape, same
-    # pattern as ensure_self_view_auto_approve()'s own route above);
+    # own module banner for the full URL/body provenance.
     # get-local-subscriptions is a debugging/UI helper reading straight
     # from subscription_repository, not an ABDM call, so it isn't
-    # _passthrough()-wrapped either.
-
-    @router.post("/phr/subscription/ensure-self-subscription", summary="P13 -- 8.3.2 with hiu.id=CLIENT_ID, the subscription-equivalent of consent auto-approve -- see data_flow.py's own ensure_self_subscription()")
-    def subscription_ensure_self(body: EnsureSelfSubscriptionBody) -> dict:
-        return data_flow.ensure_self_subscription(settings, body.patientAbhaAddress)
+    # _passthrough()-wrapped.
+    #
+    # P19 removed /phr/subscription/ensure-self-subscription (8.3.2 with
+    # hiu.id=CLIENT_ID) -- superseded by the locker routes above.
 
     @router.post("/phr/subscription/get-local", summary="P13 -- every locally-known subscription attempt for one patient (subscription_request table), no live ABDM round trip")
     def subscription_get_local(body: GetLocalSubscriptionsBody) -> dict:

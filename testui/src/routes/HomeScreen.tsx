@@ -36,205 +36,36 @@
  *   Investigations/...), parsed from the FHIR bundle Data Flow (spec §7)
  *   retrieves -- see the FHIR-rendering section below.
  *
- * DATA FLOW (spec §7) LIVES HERE NOW, NOT IN CONSENT MANAGER -- MOVED,
- * 2026-09-01, Aayush's own explicit direction after seeing a reference
- * app's real flow (Home -> facility -> record -> View Details/Pull
- * Records, with View Details showing genuinely parsed clinical content,
- * not raw JSON). An earlier version of this feature lived inside
- * ConsentScreen.tsx's own Level 3 (per that chunk's own original task
- * prompt, which explicitly said not to build a new screen) -- removed
- * from there entirely, not duplicated, once this location was confirmed
- * as the intended one.
+ * DATA FLOW (spec §7) LIVES HERE NOW, NOT IN CONSENT MANAGER -- MOVED
+ * 2026-09-01 on Aayush's own direction: pulling a record belongs next to
+ * the record, not in a separate consent admin screen. "Pull Records" on a
+ * facility fetches its care contexts' actual clinical content, and Level 3
+ * renders the decrypted FHIR bundle.
  *
- * THE HARD PART THIS MOVE INTRODUCED: Data Flow needs a consentId/hipId/
- * hiuId/date-range to call repo/'s own initiate_health_information_request()
- * (see aegle_phr/phr/data_flow.py's own banner) -- but a Linked Record
- * (spec §9) carries NONE of those; it's a completely different ABDM data
- * model from a Consent artefact (spec §6). extractCoveringConsents()
- * below bridges the two: fetches consent artefacts (#11/
- * GetAllConsentArtefacts, same call ConsentScreen.tsx's own "Approved"
- * tab uses) alongside Linked Records on page load, and maps
- * hip.id -> {consentId, hiuId, dateRange}.
+ * WHERE THE CONTENT COMES FROM (rewritten in P19). Everything shown here
+ * is data OUR OWN HEALTH LOCKER fetched for this patient, and nothing
+ * else. The locker holds a subscription for the patient, so ABDM alerts it
+ * whenever a care context is linked or updated; the backend raises a
+ * consent as the locker and the locker's own auto-approval policy grants
+ * it. By the time this screen renders, the consents it can pull under are
+ * exactly the ones our locker raised -- extractCoveringConsents() enforces
+ * that with a single check, consentDetail.hiu.id === our locker id.
  *
- * WHICH ARTEFACT COUNTS AS "COVERING" -- REWRITTEN (P9, 2026-09-02),
- * REPLACING A REAL BUG: this used to accept ANY GRANTED artefact for a
- * HIP, whoever it was requested by -- meaning a doctor's own consent
- * (about the DOCTOR's own access) and the patient's own ability to view
- * their own linked records could resolve to the exact same artefact.
- * PHR (this screen), HIP (a facility), and HIU (an entity requesting a
- * patient's data) are three genuinely distinct roles in ABDM's model, and
- * that blended them purely because this one sandbox happens to operate
- * all three under one ABDM client -- a real, Aayush-flagged bug ("the
- * consent is mainly for HIU requesting data ... why is there such a
- * confusion being created in the code"), not a design choice. Fixed by
- * filtering strictly on `purpose.code === "PATRQT"` (self-view's own real
- * ABDM purpose code) below, and by this page now RAISING its own
- * dedicated self-view consent automatically (see the provisioning section
- * below) rather than ever reusing whatever else happened to be granted.
- *
- * SELF-VIEW AUTO-PROVISIONING (P9): on load, and again whenever Linked
- * Records changes, this page checks every linked HIP for a covering
- * (PATRQT-GRANTED) consent. If any HIP lacks one AND no PATRQT request is
- * already outstanding from this app, it raises ONE broad self-view
- * request (aegle_phr/phr/data_flow.py's own request_self_view_consent(),
- * covering every linked HIP's own hiType in one call, not one request per
- * facility) and polls briefly for it to auto-grant.
- *
- * THE WORKING ASSUMPTION THIS RESTS ON, NOT YET PROVEN FOR THIS PROJECT'S
- * OWN REGISTRATION -- see data_flow.py's own banner for the full evidence
- * and reasoning: Aayush has observed ABDM's own external sandbox app
- * auto-grant PATRQT requests with no visible approval step, but this has
- * never been confirmed for a PATRQT request raised through THIS project's
- * own HIU registration specifically. If the poll below times out, this is
- * NOT treated as a failure -- the request is simply left exactly where
- * P8's own Requests tab / Approve picker (ConsentScreen.tsx) can act on
- * it, same as any other pending request, and this page shows a plain
- * "waiting for your approval" state rather than an error. Nothing here
- * breaks if the assumption turns out false; it just becomes less
- * automatic, one manual approval instead of zero.
- *
- * AUTO-FETCH (P9): once a HIP has a covering consent -- whether it
- * auto-granted or was manually approved -- its records are pulled
- * automatically (see the auto-fetch effect below), so the patient never
- * needs to click "Pull Records" just to see data behind access that
- * already exists. Manual "Refresh" stays available everywhere Pull
- * Records used to be, for an on-demand re-pull (e.g. after a new visit).
- *
- * A FOREIGN PATRQT CONSENT CAN LOOK LIKE COVERAGE WHEN IT ISN'T --
- * CONFIRMED LIVE, FIXED (P10, 2026-09-02): purpose.code === "PATRQT"
- * alone turned out to be necessary but not sufficient. Consent Manager's
- * artefact list isn't scoped to consents WE raised -- ABDM's own
- * external sandbox app self-grants itself a PATRQT consent on every
- * HIP-Initiated link too (confirmed against real storage/log evidence,
- * 2026-09-02: a Pooja Rameshkumar / Aayush Health Care link produced
- * exactly this), and that artefact is INDISTINGUISHABLE from our own by
- * purpose.code, since both legitimately use the same code for the same
- * reason. Before this fix, extractCoveringConsents() treated that
- * foreign artefact as "covering," so the self-view effect above never
- * even ran -- our own request was never raised, and the only visible
- * symptom was pullRecords() failing with data_flow.py's own "no local
- * record of consent" error forever, with no way to recover on its own.
- * Fixed with two changes, both real, neither cosmetic:
- *   1. pullRecords() below now watches for data_flow.py's own
- *      "consent_not_in_local_cache" reasonCode specifically (a stable,
- *      machine-checkable field added alongside the prose error, NOT a
- *      string-match against text that's free to reword) and records that
- *      consentId into knownBadConsentIds -- state, so it re-triggers the
- *      self-view effect's own coverage check.
- *   2. extractCoveringConsents() now collects EVERY GRANTED PATRQT
- *      candidate per HIP (a HIP can genuinely have more than one once
- *      our own request lands alongside a still-present foreign one) and
- *      picks the first NOT in knownBadConsentIds -- if every candidate
- *      for a HIP is known-bad, that HIP is left out of the map entirely,
- *      so it reads as plain "uncovered," and the self-view effect
- *      raises OUR OWN request for it. The auto-fetch effect's own
- *      dedup guard is keyed by consentId now (not hipKey), specifically
- *      so a HIP whose covering consent CHANGES (foreign, known-bad ->
- *      our own, working) gets auto-fetched again under the new one,
- *      rather than being silently skipped forever because it was
- *      already "tried" once under the old one.
- *
- * P10 STILL WASN'T THE WHOLE STORY -- A SECOND, DEEPER INSTANCE OF THE
- * SAME BUG, CONFIRMED LIVE AND FIXED (P11, 2026-09-02): P10 fixed WHICH
- * artefact gets USED once a HIP has more than one PATRQT candidate --
- * but the self-view effect's own DEDUP CHECK (deciding whether to raise
- * our own request AT ALL) had the identical "purpose.code alone, no
- * check on who raised it" flaw, one level earlier, and P10 never touched
- * it. Confirmed via real evidence, not inference: Pooja Rameshkumar's
- * account got stuck showing "waiting for your approval" indefinitely,
- * and repo/storage/api_capture/m3_*.jsonl -- across EVERY day this
- * project has existed -- has ZERO PATRQT-purposed initiate-consent-
- * request calls for ANY patient. Our own raise had never once actually
- * fired, despite the UI implying an approval was pending. Root cause:
- * ABDM's own external sandbox app's PATRQT self-grant can sit as
- * REQUESTED (not always the near-instant auto-grant observed elsewhere)
- * -- and hasRequested/hasGranted in the self-view effect matched ANY
- * PATRQT entry regardless of requester, so that foreign, not-yet-decided
- * request permanently blocked our own from ever being raised. Doubly
- * broken from the patient's side too: even if that foreign request COULD
- * be approved through this app's own Consent Manager, approving it would
- * grant the FOREIGN app's own registration, not ours -- repo/'s local
- * cache would still never have a row for it, so Home's "Pull Records"
- * could never have started working no matter how long anyone waited or
- * how many times it was approved.
- *
- * FIXED by adding the ONE check P9's own original design note explicitly
- * (and, in hindsight, wrongly) said wasn't needed: requester.name ===
- * SELF_VIEW_REQUESTER_NAME ("Aegle PHR — My Records", must stay
- * byte-for-byte identical to data_flow.py's own request_self_view_consent()
- * literal). That original reasoning was sound for the FETCH-safety
- * question P9/P10 were solving (repo/'s local-cache precondition really
- * does make a foreign artefact unusable regardless of requester.name) --
- * it just didn't cover this EARLIER decision (whether to raise at all),
- * where no such structural safety net exists yet. Applied in two places:
- * the self-view effect's own hasRequested/hasGranted (the actual fix for
- * this bug), and, as a proactive companion to knownBadConsentIds (not a
- * replacement -- see extractCoveringConsents()'s own inline comment),
- * excluding a foreign artefact from candidacy up front instead of only
- * ever discovering it's foreign after one wasted failed pull attempt.
- *
- * P11 WASN'T THE END OF IT EITHER -- A GENUINELY OWN, GENUINELY GRANTED
- * CONSENT STILL COULDN'T BE FETCHED, ROOT CAUSE FOUND LIVE (P12,
- * 2026-09-02): after P11 shipped, self-view requests DID start raising
- * correctly (repo/storage/api_capture/server_2026-09-02.jsonl shows 6
- * separate PATRQT raises for the SAME account this same day, all 202
- * Accepted, all with the correct requester name and hiTypes) -- yet Home
- * kept showing the exact same "waiting for your approval" state. Traced
- * with real evidence, not guessed: every one of those 6 raises got its
- * on-init ack from ABDM correctly (repo/storage/api_capture/m3_*.jsonl,
- * consent_hiu_on_init, ~0.3-0.6s after each raise -- the callback pipeline
- * itself is fine) -- but NOT ONE was ever followed by a consent_hiu_notify
- * callback, the rest of the day, even though notify callbacks for OTHER
- * (third-party, CAREMGT-purposed) requests earlier the same day arrived
- * completely normally. repo/storage/hiu_consents.jsonl confirms the
- * downstream consequence: zero entries for this patient, ever -- repo/'s
- * own fetch_consent() (which the notify callback is what normally
- * triggers automatically) had structurally never been called for any of
- * them. Working theory, NOT a confirmed ABDM spec fact, just what the
- * evidence shows: ABDM's notify webhook exists to tell a THIRD PARTY what
- * a patient decided -- for a PATRQT request, where the "HIU" and the
- * patient's own decision are the same actor, ABDM's real sandbox may
- * simply never fire it.
- *
- * FIXED without needing that callback at all: since Home already learns
- * the moment a PATRQT request becomes GRANTED via its own #4 polling
- * (independent of any callback), pullRecords() below now explicitly
- * calls a NEW backend function -- aegle_phr/phr/data_flow.py's own
- * trigger_consent_fetch(), a thin wrapper over repo/'s own existing
- * fetch_consent() -- the instant a "consent_not_in_local_cache" failure
- * is seen, then retries the SAME pull a few bounded times
- * (FETCH_TRIGGER_MAX_ATTEMPTS x FETCH_TRIGGER_RETRY_INTERVAL_MS = 15s),
- * giving fetch_consent()'s OWN on-fetch callback -- proven working
- * already, e.g. for Aayush's own CAREMGT test consents -- time to land.
- * Only falls through to knownBadConsentIds (P10) if that retry budget is
- * ALSO exhausted, which by then really does mean unrecoverable from here.
- *
- * "PULL RECORDS" IS SCOPED PER-HIP, NOT PER-RECORD, even though the
- * button appears on each record row (matching the reference app's own
- * layout): ABDM's own Health Information Request is date-range/HIP
- * scoped, not single-care-context scoped -- one pull naturally retrieves
- * every care context the covering consent allows for that HIP at once.
- * Tapping Pull Records on ANY record under a HIP triggers the SAME
- * underlying call and populates every other record under that same HIP
- * too, once it completes.
- *
- * "VIEW DETAILS" shows whatever this session has ALREADY pulled for the
- * matching care context (matched by careContextReference against the
- * record's own careContexts[]) -- in-memory only (pullStateByHip below),
- * not persisted across a reload. If nothing's been pulled yet, Level 3
- * shows a plain prompt to go back and pull first, rather than a blank
- * screen or an error.
- *
- * FHIR PARSING -- GROUNDED IN REAL CAPTURED DATA, NOT GENERIC FHIR:
- * every field path below (Condition.code, Observation.component[].
- * valueQuantity, MedicationRequest.medicationCodeableConcept,
- * DiagnosticReport.conclusion, Composition.author/custodian, Encounter.
- * class/period, Patient.name/gender/birthDate) was checked directly
- * against repo/storage/hiu_health_information.jsonl's own real, already-
- * decrypted sandbox content before writing this, not assumed from the
- * FHIR spec generically. Still defensive throughout (a field that isn't
- * there renders as absent, not a crash) since a different HIP's own real
- * data could shape these differently.
+ * WHAT P19 DELETED FROM THIS FILE, and why none of it is missed:
+ *   - the self-view auto-provisioning effect, which spotted an uncovered
+ *     HIP, raised a PATRQT self-view consent for it, and polled ABDM for
+ *     that request to be granted;
+ *   - SelfViewWaitingCallout, which narrated those phases to the patient;
+ *   - knownBadConsentIds and its localStorage persistence, which
+ *     remembered consent ids that could never be pulled;
+ *   - three fire-and-forget login calls (discoverSelfViewConsents,
+ *     ensureSelfSubscription, ensureSelfViewAutoApprove).
+ * All of it existed to work around one problem: a PATRQT consent raised by
+ * THIS app was indistinguishable from a PATRQT self-grant belonging to a
+ * DIFFERENT app, so the screen had to guess, try, fail, and remember. With
+ * the locker there is an unambiguous owner on every consent, so the guess
+ * -- and everything built to survive guessing wrong -- is gone. The
+ * patient is no longer asked to wait for, or approve, anything here.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -256,7 +87,6 @@ import {
   Pill,
   RefreshCw,
   Search,
-  ShieldCheck,
   Stethoscope,
   Syringe,
   UserRound,
@@ -264,21 +94,19 @@ import {
 
 import {
   getAllConsentArtefacts,
-  getAllConsentRequests,
-  discoverSelfViewConsents,
-  ensureSelfSubscription,
-  ensureSelfViewAutoApprove,
+  getLockerRecords,
+  getLockerStatus,
   getAllLinkedRecords,
   getHealthInformationStatus,
   getProfile,
   requestHealthInformation,
-  requestSelfViewConsent,
   triggerConsentFetch,
 } from "../api/endpoints";
+import type { LockerRecord, LockerStatus } from "../api/endpoints";
 import type { AbdmPassthrough, ApiResult } from "../api/types";
 import { RawBody } from "../components/RawBody";
 import { Badge } from "../components/ui/Badge";
-import { Button, ButtonLink } from "../components/ui/Button";
+import { Button } from "../components/ui/Button";
 import { Callout } from "../components/ui/Callout";
 import { Card, CardBody, CardFooter, CardTitle } from "../components/ui/Card";
 import { CardGrid } from "../components/ui/CardGrid";
@@ -331,30 +159,6 @@ function sleep(ms: number): Promise<void> {
  * HIP instead (several usually exist), rather than this app hammering the
  * same dead one forever. Same guarded-localStorage pattern as config.ts.
  */
-const KNOWN_BAD_CONSENT_IDS_STORAGE_KEY = "aegle.phr.knownBadConsentIds";
-
-function readPersistedBadConsentIds(): Set<string> {
-  if (typeof window === "undefined" || typeof window.localStorage === "undefined") return new Set();
-  try {
-    const raw = window.localStorage.getItem(KNOWN_BAD_CONSENT_IDS_STORAGE_KEY);
-    if (raw === null) return new Set();
-    const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? new Set(parsed.filter((v): v is string => typeof v === "string")) : new Set();
-  } catch {
-    return new Set();
-  }
-}
-
-function persistBadConsentIds(ids: Set<string>): void {
-  if (typeof window === "undefined" || typeof window.localStorage === "undefined") return;
-  try {
-    window.localStorage.setItem(KNOWN_BAD_CONSENT_IDS_STORAGE_KEY, JSON.stringify(Array.from(ids)));
-  } catch {
-    /* ignore -- this session still has it in React state either way */
-  }
-}
-
-/** "2026-08-12T10:15:39.581Z" -> "12-Aug-2026". Falls back to the raw string if it doesn't parse as a date. */
 function formatDate(iso: string): string {
   if (iso === "") return "";
   const date = new Date(iso);
@@ -496,131 +300,61 @@ interface CoveringConsent {
 }
 
 /**
- * Bridges Linked Records (spec §9, no consentId at all) to Data Flow
- * (spec §7, needs one) -- see this file's own banner for the full story.
+ * Which GRANTED consents cover each HIP, so "Pull Records" has something
+ * to pull under. Returns every usable candidate per HIP, not just one --
+ * a single HIP can have SEVERAL granted artefacts at once (confirmed live:
+ * one covering all four of a patient's linked care contexts at a facility,
+ * plus three narrower ones each covering a single context). Each ABDM
+ * data-flow request only ever returns what ITS OWN consent covers and
+ * there is no call that unions coverage, so the only way to see everything
+ * is to pull from every candidate and merge -- see pullRecords().
  *
- * REWRITTEN (P9, 2026-09-02), REPLACING the earlier "first GRANTED match
- * per HIP, whoever it was granted to" simplification -- that used to
- * blend a THIRD PARTY's own consent (e.g. a doctor's, about the doctor's
- * own access) with the patient's own self-view, since it accepted ANY
- * GRANTED artefact for a HIP regardless of who requested it. PHR (this
- * screen, the patient viewing their own data), HIP (a facility), and HIU
- * (an entity requesting a patient's data) are three genuinely distinct
- * roles in ABDM's model -- the fact this one sandbox happens to operate
- * all three under one ABDM client must never mean the CODE treats them as
- * interchangeable. Fixed by filtering strictly on
- * `consentDetail.purpose.code === "PATRQT"` -- the spec's own real
- * "Self-Requested" purpose code (confirmed in repo/tools/m3_test_suite/
- * common.py's own purpose table, cross-referenced against a real captured
- * example) -- since P9 now raises self-view under exactly this purpose
- * code (see aegle_phr/phr/data_flow.py's own request_self_view_consent()).
- * No separate `requester.name` check is layered on top -- NOT needed:
- * repo/server/hiu_health_information.py's own precondition
- * (get_hiu_consent(consent_id)) only ever has a row for a consent OUR OWN
- * registration itself raised and fetched, so a PATRQT consent raised by a
- * DIFFERENT app entirely (e.g. ABDM's own external sandbox app) is
- * structurally unusable here regardless of what its requester.name says
- * -- the call would simply fail locally with a clear "no local record"
- * error before ever reaching ABDM. purpose.code alone is therefore
- * sufficient to keep self-view from ever blending with a doctor's/third-
- * party's grant (which uses some OTHER purpose code, e.g. CAREMGT).
+ * REWRITTEN IN P19, and much simpler than what it replaced. The old
+ * version had to guess: it filtered on purpose.code === "PATRQT" plus a
+ * requester.name check plus a reactive knownBadConsentIds set persisted in
+ * localStorage, all because self-view consents raised by THIS app were
+ * genuinely indistinguishable from PATRQT self-grants belonging to a
+ * DIFFERENT app (ABDM's own sandbox PHR self-grants on every link), and
+ * the only way to tell them apart was to try one and watch it fail.
+ *
+ * With the Health Locker there is an unambiguous discriminator:
+ * consentDetail.hiu.id. A consent our locker raised carries our locker's
+ * id; nobody else's does. That is the same rule the backend enforces
+ * (locker_service._is_ours()), so the two agree by construction rather
+ * than by two different heuristics happening to line up. No purpose
+ * sniffing, no requester-name matching, no known-bad list.
  *
  * Same defensive wrapped-or-flat consentDetail handling as
- * ConsentScreen.tsx's own extractArtefactItem(), duplicated here rather
- * than imported per this codebase's own per-screen-helper convention.
- *
- * REWRITTEN AGAIN (P10, 2026-09-02) -- purpose.code === "PATRQT" alone
- * turned out to be NECESSARY but not SUFFICIENT: Consent Manager's own
- * artefact list isn't scoped to consents WE raised, so a PATRQT-GRANTED
- * artefact for a HIP can genuinely belong to a DIFFERENT app/registration
- * entirely (confirmed live, 2026-09-02: ABDM's own external sandbox app
- * self-grants itself PATRQT access on every HIP-Initiated link, same as
- * ours does) -- structurally unusable here (repo/'s own local consent
- * cache will never have a row for it, see data_flow.py's own
- * ConsentNotActiveError/"consent_not_in_local_cache" story), but
- * INDISTINGUISHABLE from our own genuine grant by purpose.code alone,
- * since both use exactly the same code for exactly the same reason. The
- * only way to tell them apart is to have actually TRIED one and watched
- * it fail that specific way -- see knownBadConsentIds below, threaded in
- * from the component so this function can prefer/exclude accordingly.
- *
- * Collects EVERY GRANTED PATRQT candidate per HIP, and returns ALL of
- * them (minus known-bad ones), not just one -- REWRITTEN (2026-09-05)
- * to fix a real bug found live: a single HIP can have SEVERAL separate
- * GRANTED self-view artefacts at once (confirmed against real storage
- * evidence -- ABDM granted one covering all 4 of a patient's linked care
- * contexts at Aayush Health Care, PLUS three more, each covering only a
- * single one of those same 4). The previous version picked just the
- * FIRST usable candidate per HIP and permanently ignored the rest, so
- * whichever candidate came first in ABDM's own artefact list decided how
- * many care contexts were ever actually pulled -- in that real case, a
- * narrow one-care-context artefact happened to be picked, silently
- * capping "Pull Records" at 1 of 4 linked records even though a broader,
- * equally-GRANTED artefact for the same HIP existed unused right next to
- * it. Each ABDM data-flow request only ever returns what ITS OWN consent
- * covers -- there is no single call that unions coverage across several
- * consents -- so the only way to see everything a patient has actually
- * been granted is to pull from every usable candidate and merge the
- * results (see pullRecords()'s own comment for how the merge works).
- * If EVERY candidate for a HIP is known-bad, that HIP is left OUT of the
- * returned map entirely -- deliberately, so it reads as plain "uncovered"
- * everywhere this map is consumed (the self-view effect's own coverage
- * check included), rather than needing every caller to separately know
- * about "covered, but only by something broken."
+ * ConsentScreen.tsx's own extractArtefactItem(), duplicated here per this
+ * codebase's own per-screen-helper convention.
  */
-function extractCoveringConsents(body: unknown, knownBadConsentIds: Set<string>): Map<string, CoveringConsent[]> {
-  const candidatesByHip = new Map<string, CoveringConsent[]>();
-  if (body === null || typeof body !== "object" || !("consentArtefacts" in body)) return new Map();
+function extractCoveringConsents(body: unknown, lockerId: string): Map<string, CoveringConsent[]> {
+  const map = new Map<string, CoveringConsent[]>();
+  if (lockerId === "") return map;
+  if (body === null || typeof body !== "object" || !("consentArtefacts" in body)) return map;
   const artefacts = (body as { consentArtefacts: unknown }).consentArtefacts;
-  if (!Array.isArray(artefacts)) return new Map();
+  if (!Array.isArray(artefacts)) return map;
 
   for (const item of artefacts) {
     if (item === null || typeof item !== "object") continue;
     if (stringField(item, "status").toUpperCase() !== "GRANTED") continue;
     const wrapped = objField(item, "consentDetail");
     const detail = Object.keys(wrapped).length > 0 ? wrapped : (item as Record<string, unknown>);
-    const purpose = objField(detail, "purpose");
-    if (purpose.code !== "PATRQT") continue;
-    // P11 -- proactive requester check, alongside (not instead of) the
-    // reactive knownBadConsentIds backstop above: a foreign app's own
-    // PATRQT-GRANTED artefact carries ITS OWN requester.name, not ours
-    // (SELF_VIEW_REQUESTER_NAME) -- excluding it here means we never even
-    // ATTEMPT a doomed pull against it in the first place, rather than
-    // relying solely on watching one fail. Kept as a defensive PAIR, not
-    // a replacement: if a real response ever omits requester.name (blank
-    // string here), this check can't exclude it, and knownBadConsentIds
-    // still catches it after one failed attempt -- same "don't trust a
-    // single mechanism" discipline as everywhere else in this file.
-    //
-    // P13 (2026-09-03) -- SECOND legitimate requester shape, NOT a
-    // foreign app: ABDM's own sandbox natively grants self-view under
-    // hiu.id "sbx_001" with requester {"name": "SELF", "identifier":
-    // {"type": "SELF", ...}} -- confirmed live, real FHIR data
-    // successfully pulled and decrypted using one of these. This is
-    // NOT "some other app's own competing grant" (the case this guard
-    // exists to exclude) -- it's ABDM itself, independent of any app,
-    // and data_flow.py's own discover_self_view_consents() (called once
-    // per session, see this file's own login effect) registers exactly
-    // these with repo/'s local cache so a pull actually succeeds. Before
-    // this fix, requester.name here was "SELF", never matched
-    // SELF_VIEW_REQUESTER_NAME, so EVERY native grant was silently
-    // treated as foreign/uncovered forever -- Home kept re-raising its
-    // own request and polling, even once discovery had already made the
-    // pull work on the backend, because this frontend check never got a
-    // chance to see it as covering in the first place.
-    const requester = objField(detail, "requester");
-    const requesterIdentifier = objField(requester, "identifier");
-    const isOwnRequest = requester.name === SELF_VIEW_REQUESTER_NAME;
-    const isNativeSelfGrant = requester.name === "SELF" || requesterIdentifier.type === "SELF";
-    if (!isOwnRequest && !isNativeSelfGrant) continue;
-    const hip = objField(detail, "hip");
+
+    // THE one check that matters: did OUR locker raise this?
     const hiu = objField(detail, "hiu");
+    if (hiu.id !== lockerId) continue;
+
+    const hip = objField(detail, "hip");
     const permission = objField(detail, "permission");
     const dateRange = objField(permission, "dateRange");
     const hipId = typeof hip.id === "string" ? hip.id : "";
     if (hipId === "") continue;
-    const consentId = typeof detail.consentId === "string" ? detail.consentId : typeof detail.requestId === "string" ? detail.requestId : "";
+    const consentId = typeof detail.consentId === "string"
+      ? detail.consentId
+      : typeof detail.requestId === "string" ? detail.requestId : "";
     if (consentId === "") continue;
+
     const candidate: CoveringConsent = {
       consentId,
       hipId,
@@ -628,16 +362,11 @@ function extractCoveringConsents(body: unknown, knownBadConsentIds: Set<string>)
       periodFrom: typeof dateRange.from === "string" ? dateRange.from : "",
       periodTo: typeof dateRange.to === "string" ? dateRange.to : "",
     };
-    const existing = candidatesByHip.get(hipId);
+    const existing = map.get(hipId);
     if (existing) existing.push(candidate);
-    else candidatesByHip.set(hipId, [candidate]);
+    else map.set(hipId, [candidate]);
   }
 
-  const map = new Map<string, CoveringConsent[]>();
-  for (const [hipId, candidates] of candidatesByHip) {
-    const usable = candidates.filter((c) => !knownBadConsentIds.has(c.consentId));
-    if (usable.length > 0) map.set(hipId, usable);
-  }
   return map;
 }
 
@@ -712,6 +441,62 @@ function mergedCareContexts(pullState: PullState): Record<string, PulledCareCont
   for (const c of withData) Object.assign(merged, c.careContexts);
   return merged;
 }
+
+/**
+ * P20 -- builds the per-HIP display state from what the LOCKER ALREADY
+ * HOLDS, so a login shows records immediately instead of firing a data
+ * request per hospital and waiting for each one.
+ *
+ * This is the whole point of being a Health Locker rather than a proxy.
+ * The locker collects each care context once, when it becomes available
+ * (an 8.3.11 alert, or the one-off backfill), and is entitled to keep it
+ * for the life of the consent behind it. So a login reads storage.
+ *
+ * Deliberately produces the SAME PullState shape the on-demand pull
+ * produces, rather than a parallel path: every rendering branch,
+ * expand/collapse and bundle viewer below keeps working untouched, and
+ * "pull records" stays available as a manual refresh. busy/timedOut are
+ * false because nothing is in flight -- this data is already here.
+ */
+function pullStateFromLockerRecords(records: LockerRecord[]): Record<string, PullState> {
+  const byHip: Record<string, Record<string, ConsentPullState>> = {};
+
+  for (const record of records) {
+    const hipId = record.hipId ?? "";
+    if (hipId === "" || record.bundle == null) continue;
+    const consentId = record.consentId ?? "locker";
+
+    const consents = (byHip[hipId] ??= {});
+    const entry = (consents[consentId] ??= {
+      ...emptyConsentPullState(consentId),
+      careContexts: {},
+    });
+    (entry.careContexts as Record<string, PulledCareContext>)[record.careContextReference] = {
+      hiStatus: "OK",
+      description: "Held by your health locker",
+      bundle: record.bundle,
+    };
+  }
+
+  const result: Record<string, PullState> = {};
+  for (const [hipId, consents] of Object.entries(byHip)) {
+    result[hipId] = { noConsent: false, consents: Object.values(consents) };
+  }
+  return result;
+}
+
+/**
+ * How often the Home screen re-reads the locker.
+ *
+ * BACKFILL_POLL_MS is fast because the patient is actively waiting on a
+ * first-ever login and the screen is visibly incomplete until it lands.
+ * RECORDS_POLL_MS is slow because nothing is pending -- it exists only to
+ * catch a record that arrived on its own while the app was open, and the
+ * focus listener alongside it catches the common case far sooner than any
+ * interval would. Both hit a local database read, never ABDM.
+ */
+const BACKFILL_POLL_MS = 4000;
+const RECORDS_POLL_MS = 30000;
 
 function isPullBusy(pullState: PullState): boolean {
   return pullState.consents.some((c) => c.busy);
@@ -1146,89 +931,29 @@ function FhirRecordCard({ bundle, hipLabel }: { bundle: unknown; hipLabel: strin
  * granted PATRQT request permanently block us from ever raising (or
  * using) our own.
  */
-const SELF_VIEW_REQUESTER_NAME = "Aegle PHR — My Records";
-
-interface ConsentRequestPurposeStatus {
-  status: string;
-  purposeCode: string;
-  requesterName: string;
-}
-
-/** Minimal reader over #4's own requests[] -- only what the dedup check below needs (status + purpose.code + requester.name, the last one added P11 -- see SELF_VIEW_REQUESTER_NAME's own docstring), not the full ConsentRequestSummary ConsentScreen.tsx builds (duplicated per-screen-helper convention, same as everything else in this file). */
-function extractConsentRequestPurposeStatuses(body: unknown): ConsentRequestPurposeStatus[] | null {
-  if (body === null || typeof body !== "object" || !("requests" in body)) return null;
-  const requests = (body as { requests: unknown }).requests;
-  if (!Array.isArray(requests)) return null;
-  const out: ConsentRequestPurposeStatus[] = [];
-  for (const item of requests) {
-    if (item === null || typeof item !== "object") continue;
-    const purpose = objField(item, "purpose");
-    const requester = objField(item, "requester");
-    out.push({
-      status: stringField(item, "status"),
-      purposeCode: typeof purpose.code === "string" ? purpose.code : "",
-      requesterName: typeof requester.name === "string" ? requester.name : "",
-    });
-  }
-  return out;
-}
-
-type SelfViewPhase = "idle" | "checking" | "raising" | "polling" | "pending_approval" | "granted" | "error";
-
-interface SelfViewState {
-  phase: SelfViewPhase;
-  message: string;
-}
-
-const SELF_VIEW_IDLE: SelfViewState = { phase: "idle", message: "" };
-
 /**
- * "A few attempts, clear timeout" -- same convention as Data Flow's own
- * POLL_MAX_ATTEMPTS/POLL_INTERVAL_MS above, deliberately a SHORTER budget
- * here: this is polling for a status word to flip (ABDM/CM-side), not
- * waiting on a HIP's own data push, and the working assumption's own
- * evidence point (an externally-raised PATRQT notify observed arriving
- * "GRANTED" about ONE second after the triggering UIL confirm) suggests
- * this should resolve fast if it resolves automatically at all -- 20s
- * gives generous margin above that single data point while still failing
- * into the manual-approval fallback quickly if the assumption is wrong
- * for this project's own registration, rather than making every login
- * wait a long time to find out.
+ * Shown when a facility's records are not (yet) pullable. P19 replaced
+ * SelfViewWaitingCallout, which narrated a raise-and-poll cycle this app
+ * no longer performs: the locker's own auto-approval grants its consents,
+ * so there is nothing for the patient to wait on or approve by hand.
+ * What IS worth telling them apart is whether the locker is switched on
+ * at all -- that is the one thing they can act on.
  */
-const SELF_VIEW_POLL_INTERVAL_MS = 2000;
-const SELF_VIEW_POLL_MAX_ATTEMPTS = 10;
-
-/** Broad default hiTypes for the self-view request when no linked record carries an hiType at all (a genuinely empty request would ask ABDM for nothing) -- same literal list ConsentScreen.tsx's own Auto-Approve section already offers as choices. */
-const SELF_VIEW_DEFAULT_HI_TYPES = [
-  "Prescription", "DiagnosticReport", "OPConsultation", "DischargeSummary",
-  "ImmunizationRecord", "HealthDocumentRecord", "WellnessRecord", "Invoice",
-];
-
-/**
- * P9 item 3 -- "a HIP that's linked but NOT yet covered ... should show
- * its own clear state, not an error and not a blank Fetch Record button
- * pretending nothing is happening." Reads the SAME selfViewState the
- * provisioning effect above drives, so the message here always matches
- * what's actually happening (checking/raising/polling/waiting-on-you),
- * rather than a generic "no access" callout unrelated to what's really
- * going on for this HIP.
- */
-function SelfViewWaitingCallout({ state }: { state: SelfViewState }): JSX.Element {
-  if (state.phase === "pending_approval") {
+function NoCoverageCallout({ lockerOn }: { lockerOn: boolean }): JSX.Element {
+  if (!lockerOn) {
     return (
-      <Callout tone="warning" icon={ShieldCheck}>
-        <p style={{ margin: 0 }}>{state.message}</p>
-        <ButtonLink variant="secondary" size="sm" icon={ShieldCheck} to="/consent">Open Consent Manager</ButtonLink>
+      <Callout tone="info">
+        Automatic record collection is off, so nothing has been fetched from this facility yet. You
+        can switch it on under Subscriptions.
       </Callout>
     );
   }
-  if (state.phase === "error") {
-    return <Callout tone="warning">{state.message}</Callout>;
-  }
-  if (state.phase === "checking" || state.phase === "raising" || state.phase === "polling") {
-    return <Callout>{state.message}</Callout>;
-  }
-  return <Callout>Waiting for access to this facility's records — checking shortly.</Callout>;
+  return (
+    <Callout tone="info">
+      Nothing has arrived from this facility yet. New records appear on their own once the facility
+      shares them — there is nothing you need to do.
+    </Callout>
+  );
 }
 
 export function HomeScreen(): JSX.Element {
@@ -1248,37 +973,58 @@ export function HomeScreen(): JSX.Element {
   const [selectedHip, setSelectedHip] = useState<HipGroup | null>(null);
   const [selectedRecord, setSelectedRecord] = useState<LinkedRecord | null>(null);
   const [pullStateByHip, setPullStateByHip] = useState<Record<string, PullState>>({});
-  const [selfViewState, setSelfViewState] = useState<SelfViewState>(SELF_VIEW_IDLE);
-  const selfViewRunningRef = useRef(false);
   const autoFetchTriggeredRef = useRef<Set<string>>(new Set());
-  /** P11 -- true once ensureSelfViewAutoApprove() has been ATTEMPTED this session (regardless of outcome) -- a ref, not state, so it survives re-renders without itself triggering one, and so it's checked/set synchronously (no risk of two overlapping effect runs both deciding to call it). Deliberately "attempted," not "succeeded": a failure here must not block the existing raise-then-manual-approve fallback (see the self-view effect's own comment at the call site), so this is set true right after the one call, whichever way it went. */
-  const autoApproveEnsuredRef = useRef(false);
-  /**
-   * P10 -- consent ids confirmed NOT locally fetchable by us, populated
-   * the moment pullRecords() below gets back data_flow.py's own
-   * "consent_not_in_local_cache" reasonCode. React state (not a ref):
-   * this must trigger a re-render (and, via the self-view effect's own
-   * dependency array, a re-check of whether any HIP is now genuinely
-   * uncovered) the moment a candidate is confirmed bad -- a ref update
-   * alone wouldn't do either. See extractCoveringConsents()'s own banner
-   * for exactly how this gets used to pick between multiple candidates.
-   *
-   * P14 -- initialized from localStorage, not always empty -- see
-   * readPersistedBadConsentIds()'s own docstring for why a fresh page
-   * load must not forget a consent already proven permanently dead.
-   */
-  const [knownBadConsentIds, setKnownBadConsentIds] = useState<Set<string>>(() => readPersistedBadConsentIds());
 
-  /** Adds one consentId to knownBadConsentIds AND persists it -- the one place either ever happens, so the two can never drift apart. See readPersistedBadConsentIds()'s own docstring. */
-  const markConsentBad = (consentId: string): void => {
-    setKnownBadConsentIds((prev) => {
-      if (prev.has(consentId)) return prev;
-      const next = new Set(prev);
-      next.add(consentId);
-      persistBadConsentIds(next);
-      return next;
+  /**
+   * P19 -- our own locker's status, read once per login. Two jobs:
+   *   1. lockerId is the discriminator extractCoveringConsents() uses to
+   *      tell OUR consents from any other app's.
+   *   2. subscriptionUsable / needsOptIn drive what this screen tells a
+   *      patient when a facility has nothing to show yet.
+   *
+   * Replaces the P9-P13 self-view state this component used to carry --
+   * selfViewState, selfViewRunningRef, autoApproveEnsuredRef and the
+   * knownBadConsentIds set (with its localStorage persistence). All of
+   * that existed to raise a self-view consent, poll for it to be granted,
+   * and remember which candidates were permanently unusable. The locker's
+   * own auto-approval policy does that job now, server-side, so none of
+   * it has anything left to do.
+   */
+  const [lockerStatus, setLockerStatus] = useState<LockerStatus | null>(null);
+  const lockerId = lockerStatus?.lockerId ?? "";
+  const lockerOn = lockerStatus?.subscriptionUsable === true;
+
+  /** P20 -- NOT_STARTED / RUNNING / DONE / FAILED for the one-off backfill. */
+  const [lockerSyncState, setLockerSyncState] = useState<string>("");
+  const [lockerRecordCount, setLockerRecordCount] = useState<number>(0);
+
+  /**
+   * P20 -- reads the locker's own storage and seeds the per-HIP display
+   * state from it. Safe to call repeatedly: it replaces the seeded state
+   * wholesale rather than accumulating, and the backend sweeps lapsed
+   * consents before returning anything, so a record we are no longer
+   * entitled to hold disappears here on the very next read.
+   */
+  async function loadLockerRecords(): Promise<void> {
+    if (sessionAddress === "") return;
+    const result = await getLockerRecords({
+      patientAbhaAddress: sessionAddress,
+      xToken: sessionToken,
     });
-  };
+    const body = result.data?.body as
+      | { records?: LockerRecord[]; count?: number; initialSyncState?: string }
+      | undefined;
+    if (!body) return;
+
+    setLockerSyncState(body.initialSyncState ?? "");
+    setLockerRecordCount(body.count ?? 0);
+
+    const seeded = pullStateFromLockerRecords(body.records ?? []);
+    // MERGE, not replace: a HIP the patient has manually pulled during
+    // this session keeps that pull state, because it may hold something
+    // the locker has not collected yet.
+    setPullStateByHip((current) => ({ ...current, ...seeded }));
+  }
 
   useEffect(() => {
     if (sessionToken === "") return;
@@ -1300,208 +1046,97 @@ export function HomeScreen(): JSX.Element {
     // is exactly why the backend had these consents locally registered
     // even though this frontend fetch was silently missing them.
     void getAllConsentArtefacts({ xToken: sessionToken, limit: 100, status: "GRANTED" }).then(setConsentArtefactsResult);
-    // P13 -- ABDM appears to grant self-view (PATRQT) access natively, on
-    // its own, independent of anything raised through this app's own
-    // registration (confirmed live: hiu.id "sbx_001", requester "SELF").
-    // extractCoveringConsents() below already sees these as "covered"
-    // (they're real GRANTED artefacts from #9's own list), so the self-
-    // view auto-provisioning effect further down correctly never tries
-    // to raise a redundant request for them -- but a GRANTED artefact
-    // ABDM shows us isn't the same as one this app's own registration can
-    // actually PULL DATA for: repo/'s hiu_consent_repository only ever
-    // learns about a consent via ABDM's own HIU-directed notify callback,
-    // which "sbx_001" almost certainly never triggers (it isn't a HIU
-    // this bridge is registered as). Without that local record, Pull
-    // Records fails with reasonCode "consent_not_in_local_cache" the
-    // moment someone actually clicks it, even though the artefact looked
-    // fine the whole time. Firing this here, once per session alongside
-    // the other three sibling calls, closes that gap proactively instead
-    // of waiting for a failed pull to surface it -- same fire-and-forget
-    // convention as ensureSelfViewAutoApprove()'s own call below (outcome
-    // not branched on; failures surface through the Console panel like
-    // every other apiRequest() call already does). The actual local
-    // registration still lands moments later via ABDM's own on-fetch
-    // callback -- see data_flow.py's own discover_self_view_consents()
-    // docstring for the full async chain this kicks off.
-    void discoverSelfViewConsents({ xToken: sessionToken });
+    // P19 -- read our own locker's status once per login. This replaces
+    // three fire-and-forget self-view calls that used to sit here
+    // (discoverSelfViewConsents, ensureSelfSubscription and
+    // ensureSelfViewAutoApprove): between them they discovered another
+    // app's granted consents and registered them locally, and stood up a
+    // self-subscription and auto-approval policy under a borrowed HIU id.
+    // The locker does all of that properly now, so the only thing this
+    // screen still needs from the backend is which locker is ours and
+    // whether it is switched on.
+    if (sessionAddress !== "") {
+      void getLockerStatus({ xToken: sessionToken, patientAbhaAddress: sessionAddress })
+        .then((result) => { if (result.data) setLockerStatus(result.data); });
 
-    // P13 -- the subscription-equivalent of the auto-approve call two
-    // lines below: spec §8.1's own auto-approve claim for Subscriptions,
-    // set up once per session alongside consent auto-approve and
-    // discovery, so all three self-service policies get established in
-    // the same pass. No xToken needed (see ensureSelfSubscription()'s own
-    // docstring -- a REQUESTER-role call) -- fire-and-forget, same
-    // convention as its two siblings here (failure surfaces via the
-    // Console panel, never blocks anything else on this page).
-    if (sessionAddress !== "") void ensureSelfSubscription({ patientAbhaAddress: sessionAddress });
+      // P20 -- READ WHAT THE LOCKER ALREADY HOLDS. No ABDM round trip:
+      // the records were collected when they became available and are
+      // ours to keep for the life of the consent behind them. xToken is
+      // passed for one reason only -- if the one-off backfill has never
+      // run, it is what lets the backend start it (in the background;
+      // this call does not wait for it, and the poll below picks it up).
+      void loadLockerRecords();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionToken]);
 
-  const linkedRecords = extractLinkedRecords(linksResult?.data?.body ?? null);
-  const coveringConsents = extractCoveringConsents(consentArtefactsResult?.data?.body ?? null, knownBadConsentIds);
-
-  /**
-   * P9 -- self-view auto-provisioning. Re-runs whenever Linked Records or
-   * the covering-consent artefacts actually change identity (a fresh
-   * fetch resolving) -- deliberately NOT keyed on the derived
-   * linkedRecords/coveringConsents values themselves, which are new
-   * object/array/Map instances on every render and would re-fire this
-   * effect every render rather than only on a real data change.
-   * selfViewRunningRef guards against overlapping runs (e.g. a manual
-   * "Refresh" landing mid-poll) -- a ref rather than state since it must
-   * be checked synchronously, not after a state commit.
+  /*
+   * P20 -- poll ONLY while the one-off backfill is running.
    *
-   * P10 -- ALSO re-runs when knownBadConsentIds changes: a HIP that
-   * looked "covered" a moment ago (a foreign PATRQT-GRANTED artefact,
-   * indistinguishable from our own by purpose.code alone) can turn out
-   * to be genuinely uncovered the instant pullRecords() confirms that
-   * consentId isn't fetchable by us -- this effect needs a chance to
-   * notice that and actually raise our own request, which is exactly
-   * the bug this pass fixes (see extractCoveringConsents()'s own banner).
+   * The backfill is a real ABDM round trip per hospital (5-10s observed
+   * live), so a first-ever login legitimately shows an empty locker for a
+   * few seconds while history arrives. Polling stops the moment it
+   * reports DONE or FAILED -- this is not a background refresh loop, and
+   * a locker that is already synced never polls at all.
    */
   useEffect(() => {
-    if (sessionToken === "" || linksResult === null || consentArtefactsResult === null) return;
-    if (selfViewRunningRef.current) return;
-
-    const records = extractLinkedRecords(linksResult.data?.body ?? null);
-    if (records === null || records.length === 0) return;
-
-    const covering = extractCoveringConsents(consentArtefactsResult.data?.body ?? null, knownBadConsentIds);
-    const anyUncoveredHip = groupByHip(records).some((group) => !covering.has(group.key));
-    if (!anyUncoveredHip) {
-      setSelfViewState((prev) => (prev.phase === "idle" ? prev : SELF_VIEW_IDLE));
-      return;
-    }
-
-    selfViewRunningRef.current = true;
-    void (async () => {
-      try {
-        setSelfViewState({ phase: "checking", message: "Checking for existing self-view access…" });
-
-        const requestsResult = await getAllConsentRequests({ xToken: sessionToken });
-        const requests = extractConsentRequestPurposeStatuses(requestsResult.data?.body ?? null) ?? [];
-        // P11 -- requesterName === SELF_VIEW_REQUESTER_NAME, NOT purpose.code
-        // alone. Confirmed live, 2026-09-02 (Pooja Rameshkumar's account):
-        // ABDM's own external sandbox app raises its OWN PATRQT self-grant
-        // on every HIP-Initiated link, same as ours does. purpose.code
-        // alone can't tell the two apart, so without this check a foreign
-        // app's own pending (or granted) PATRQT request permanently blocks
-        // OUR OWN from ever being raised -- the patient gets stuck on
-        // "pending_approval" forever, waiting on a request that (a) isn't
-        // ours, and (b) even if approved, would grant access to the
-        // FOREIGN app's own registration, not ours -- so it could never
-        // actually fix Home's own "Pull Records," no matter how long
-        // anyone waits or how many times it's approved. See this file's
-        // own banner for the confirmed evidence trail (repo/storage/
-        // api_capture/m3_*.jsonl has zero PATRQT-purposed
-        // initiate-consent-request calls, ever, for any patient -- our own
-        // raise had never actually fired, despite the UI showing "waiting
-        // for approval").
-        const ours = requests.filter((r) => r.purposeCode === "PATRQT" && r.requesterName === SELF_VIEW_REQUESTER_NAME);
-        const hasRequested = ours.some((r) => r.status.toUpperCase() === "REQUESTED");
-        const hasGranted = ours.some((r) => r.status.toUpperCase() === "GRANTED");
-
-        if (hasRequested) {
-          // Dedup: a self-view request from this app is already outstanding --
-          // don't raise a second one. Fallback path, P8's own Approve picker.
-          setSelfViewState({ phase: "pending_approval", message: "Waiting for your approval in Consent Manager to view some of your linked records." });
-          return;
-        }
-        if (hasGranted) {
-          // A PATRQT request exists and was decided, but doesn't cover every
-          // linked HIP (ABDM/the patient resolved it to fewer facilities than
-          // are actually linked) -- accepted per this pass's own scope: one
-          // broad request, not re-raised just because it didn't end up
-          // covering everything.
-          setSelfViewState(SELF_VIEW_IDLE);
-          return;
-        }
-
-        // P11 -- set up ABDM's real Consent Auto-Approval standing policy
-        // for self-view ONCE per session, before the FIRST raise -- root
-        // cause of P9/P10's own residual failure (confirmed against real
-        // repo/storage evidence): our own self-view requests were being
-        // raised and on-init-acked correctly, but never approved by
-        // anyone, ever, so they just sat REQUESTED forever. This is what's
-        // supposed to make a request raised AFTER it auto-grant instead.
-        // A FAILURE HERE MUST NOT BLOCK THE EXISTING FALLBACK -- if setup
-        // fails, self-view degrades to exactly what it already did before
-        // this pass (raise, then sit REQUESTED, approvable through P8's
-        // own picker), not a hard failure. autoApproveEnsuredRef is set
-        // true regardless of outcome so this is only ever ATTEMPTED once
-        // per session, not retried on every HIP/every effect run.
-        if (!autoApproveEnsuredRef.current) {
-          autoApproveEnsuredRef.current = true;
-          setSelfViewState({ phase: "checking", message: "Setting up automatic access to your own records…" });
-          // Outcome deliberately not branched on beyond this -- a failure
-          // here already surfaces through the app's own Console panel
-          // (every apiRequest() call is recorded there regardless), and
-          // per this effect's own comment above, self-view must proceed
-          // to raise the request either way, not stop here.
-          await ensureSelfViewAutoApprove({ xToken: sessionToken });
-        }
-
-        // No PATRQT request exists at all yet -- raise one, broad across
-        // every linked HIP's own hiType (not per-HIP, see data_flow.py's
-        // own request_self_view_consent() docstring).
-        const hiTypesSet = new Set(records.map((r) => r.hiType).filter((h) => h !== ""));
-        const hiTypes = hiTypesSet.size > 0 ? Array.from(hiTypesSet) : SELF_VIEW_DEFAULT_HI_TYPES;
-        const now = new Date();
-        const dateRangeFrom = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000).toISOString();
-        const dateRangeTo = now.toISOString();
-
-        setSelfViewState({ phase: "raising", message: "Requesting access to view your own linked records…" });
-        const raised = await requestSelfViewConsent({ hiTypes, dateRangeFrom, dateRangeTo, patientAbhaAddress: sessionAddress });
-        if (raised.data?.ok !== true) {
-          setSelfViewState({ phase: "error", message: raised.data?.error || "Couldn't request self-view access — check the Console for details." });
-          return;
-        }
-
-        // Polls #4 for the request WE just raised to flip to GRANTED --
-        // identified by purpose.code alone (PATRQT is exclusive to self-
-        // view now), not a captured id -- see data_flow.py's own docstring
-        // for why request_self_view_consent() can't hand one back anyway.
-        setSelfViewState({ phase: "polling", message: "Requesting access to view your own linked records…" });
-        for (let attempt = 0; attempt < SELF_VIEW_POLL_MAX_ATTEMPTS; attempt += 1) {
-          await sleep(SELF_VIEW_POLL_INTERVAL_MS);
-          const pollResult = await getAllConsentRequests({ xToken: sessionToken });
-          const polled = extractConsentRequestPurposeStatuses(pollResult.data?.body ?? null) ?? [];
-          const grantedNow = polled.some((r) => r.purposeCode === "PATRQT" && r.status.toUpperCase() === "GRANTED");
-          if (grantedNow) {
-            setSelfViewState({ phase: "granted", message: "Access granted." });
-            // Refreshes coveringConsents so the newly-GRANTED PATRQT
-            // artefact(s) show up -- the auto-fetch effect below reacts to
-            // that and pulls the newly-covered HIP(s) automatically.
-            // limit/status EXPLICIT (2026-09-05, real bug found live): omitting
-    // them defaults server-side (GetAllConsentArtefactsBody, aegle_phr/
-    // phr/schemas.py) to limit=10, status="ALL" -- fine for an account
-    // with a handful of consents, but confirmed live to silently truncate
-    // a real patient's list: Pooja Rameshkumar has accumulated 15-20+
-    // consent artefacts across facilities, so only an arbitrary first-10
-    // page (of every status, not just GRANTED) ever reached
-    // extractCoveringConsents() below -- her MS Hospital umbrella consent
-    // (the one covering all 4 of that HIP's linked care contexts) fell
-    // outside that page and never became a pull candidate at all, no
-    // matter how correct the multi-consent merge logic downstream is.
-    // limit=100/status="GRANTED" matches data_flow.py's own
-    // discover_self_view_consents() call to the same #9 endpoint, which
-    // is exactly why the backend had these consents locally registered
-    // even though this frontend fetch was silently missing them.
-    void getAllConsentArtefacts({ xToken: sessionToken, limit: 100, status: "GRANTED" }).then(setConsentArtefactsResult);
-            return;
-          }
-        }
-
-        // WORKING ASSUMPTION WAS WRONG (or just slow) FOR THIS REQUEST --
-        // not a failure. Leaves it exactly where P8's own Requests tab/
-        // Approve picker can act on it, same as any other pending request.
-        setSelfViewState({ phase: "pending_approval", message: "Waiting for your approval in Consent Manager to view some of your linked records." });
-      } finally {
-        selfViewRunningRef.current = false;
-      }
-    })();
+    if (lockerSyncState !== "RUNNING") return;
+    const timer = window.setInterval(() => { void loadLockerRecords(); }, BACKFILL_POLL_MS);
+    return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionToken, linksResult, consentArtefactsResult, knownBadConsentIds]);
+  }, [lockerSyncState, sessionToken, sessionAddress]);
+
+  /*
+   * P20 -- keep the screen current while it is open.
+   *
+   * WHY THIS IS NEEDED. The locker collects a newly linked visit on its
+   * own, within seconds of the 8.3.11 alert -- but the screen read its
+   * records once, at login. Without this, a record that arrived while the
+   * patient was looking at the app stayed invisible until they reloaded,
+   * which makes "new records appear automatically" true of the locker and
+   * false of the app.
+   *
+   * CHEAP BY CONSTRUCTION. This hits /phr/locker/records, which is a local
+   * database read -- no ABDM call, no consent, no data request. So a slow
+   * poll costs essentially nothing, unlike the pre-P20 model where
+   * refreshing meant a health-information request per hospital.
+   *
+   * Also refreshes on window focus, which is what actually catches the
+   * common case: the patient switches away, a record arrives, they switch
+   * back. Skipped entirely while the backfill is RUNNING, so the two
+   * effects never poll at once.
+   */
+  useEffect(() => {
+    if (sessionAddress === "" || lockerSyncState === "RUNNING") return;
+
+    const refresh = (): void => { void loadLockerRecords(); };
+    const timer = window.setInterval(refresh, RECORDS_POLL_MS);
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lockerSyncState, sessionToken, sessionAddress]);
+
+  const linkedRecords = extractLinkedRecords(linksResult?.data?.body ?? null);
+  const coveringConsents = extractCoveringConsents(consentArtefactsResult?.data?.body ?? null, lockerId);
+
+  /*
+   * P19 removed the self-view auto-provisioning effect that lived here.
+   * It watched for any linked HIP with no covering consent, raised a
+   * PATRQT self-view request for it, then polled ABDM for that request to
+   * flip to GRANTED, narrating each phase through SelfViewWaitingCallout.
+   *
+   * None of that is needed now. The locker holds a subscription for the
+   * patient, so ABDM sends an alert whenever a new care context is linked;
+   * the backend raises a consent as the locker and the locker's own
+   * auto-approval policy grants it without the patient doing anything.
+   * There is no request for this screen to raise and nothing to poll for.
+   * What the patient sees instead, when a facility has nothing yet, is
+   * NoCoverageCallout.
+   */
+
 
   /**
    * Polls one already-initiated request's status until "complete" or the
@@ -1552,13 +1187,17 @@ export function HomeScreen(): JSX.Element {
         return;
       }
     }
-    // P14 -- a genuine timeout (POLL_MAX_ATTEMPTS x POLL_INTERVAL_MS, 90s --
+    // A genuine timeout (POLL_MAX_ATTEMPTS x POLL_INTERVAL_MS, 90s --
     // generous) means the HIP never pushed anything for this consent's own
     // care context(s), confirmed live for consents pointing at old/
-    // regenerated test data that no longer exists on the HIP side. See
-    // markConsentBad()/readPersistedBadConsentIds()'s own docstring for why
-    // this must be persisted, not just noted for this render.
-    markConsentBad(consentId);
+    // regenerated test data that no longer exists on the HIP side.
+    //
+    // P19 no longer records the consent as permanently bad here. That
+    // existed so the self-view effect would stop trusting an unusable
+    // candidate and raise its own request instead -- and that effect is
+    // gone. A locker consent that times out is worth retrying (the HIP may
+    // simply have had nothing to push yet), so the timeout is surfaced on
+    // this pull and nothing is blacklisted across sessions.
     updateConsentPullState(hipKey, consentId, { busy: false, timedOut: true });
   };
 
@@ -1632,14 +1271,13 @@ export function HomeScreen(): JSX.Element {
       // (shouldn't reach this point at all post-P11, but kept as a
       // backstop), or ours but the P12 recovery above was also
       // exhausted without success. Marking it known-bad here is what
-      // lets the self-view effect notice this HIP is actually
-      // uncovered and raise our OWN fresh request for it, instead of
-      // silently trusting a consent that can never work and stopping
-      // there forever. Only THIS one consent is affected -- any other
-      // covering consent for the same HIP keeps pulling independently.
-      if (requestResult.data?.reasonCode === "consent_not_in_local_cache") {
-        markConsentBad(covering.consentId);
-      }
+      // P19: "consent_not_in_local_cache" used to mean a foreign app's
+      // consent had been mistaken for ours, and the id was blacklisted so
+      // the self-view effect would raise our own. extractCoveringConsents()
+      // now only ever returns consents whose hiu.id IS our locker, so that
+      // mix-up cannot happen; if this still fires it means repo/ has not
+      // finished registering a genuinely-ours consent yet, which a later
+      // pull resolves. Surfaced, not blacklisted.
       updateConsentPullState(hipKey, covering.consentId, { busy: false });
       return;
     }
@@ -1781,7 +1419,7 @@ export function HomeScreen(): JSX.Element {
         <Button size="sm" icon={ArrowLeft} onClick={() => setSelectedRecord(null)}>Back</Button>
 
         {!coveringConsents.has(selectedHip.key) && careContexts === null && (
-          <SelfViewWaitingCallout state={selfViewState} />
+          <NoCoverageCallout lockerOn={lockerOn} />
         )}
         {busy && <p className="muted">{pullPhaseMessage(pullState)}</p>}
         {timedOut && (
@@ -1853,7 +1491,7 @@ export function HomeScreen(): JSX.Element {
           }
         />
 
-        {!coveringConsents.has(selectedHip.key) && <SelfViewWaitingCallout state={selfViewState} />}
+        {!coveringConsents.has(selectedHip.key) && <NoCoverageCallout lockerOn={lockerOn} />}
         {pullState.noConsent && (
           <Callout tone="warning">
             No GRANTED consent found for this facility -- Data Flow (spec §7) needs one to pull real
@@ -1950,6 +1588,31 @@ export function HomeScreen(): JSX.Element {
 
       {profileResult !== null && profileResult.data?.ok !== true && (
         <p className="result result--error">Couldn&apos;t load your profile — check the Console for details.</p>
+      )}
+
+      {/*
+        P20 -- the first-login wait, made legible.
+
+        The one-off backfill is a real ABDM round trip per hospital, so a
+        brand-new locker genuinely shows nothing for a few seconds. Without
+        this the screen is just empty, which reads as "this app has none of
+        my records" rather than "they are on their way". Only ever shown
+        while the backfill is actually RUNNING; a synced locker never
+        renders it, because after that first pass records are already here.
+      */}
+      {lockerSyncState === "RUNNING" && (
+        <Callout tone="info">
+          Collecting your existing records from your hospitals — this happens once, and takes a few
+          seconds. {lockerRecordCount > 0
+            ? `${lockerRecordCount} so far.`
+            : "New records will appear here as they arrive."}
+        </Callout>
+      )}
+      {lockerSyncState === "FAILED" && (
+        <Callout tone="warning">
+          Some of your existing records couldn&apos;t be collected. Anything already here is shown
+          below, and new records will still arrive on their own.
+        </Callout>
       )}
 
       <Card padding="md" className="ui-card--flush" style={{ marginTop: "var(--space-4)" }}>

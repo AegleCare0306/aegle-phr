@@ -681,18 +681,6 @@ export function getHealthInformationStatus(requestId: string): Promise<ApiResult
   return apiRequest<AbdmPassthrough>(`/phr/data-flow/status/${encodeURIComponent(requestId)}`);
 }
 
-export interface RequestSelfViewConsentBody {
-  hiTypes: string[];
-  dateRangeFrom: string;
-  dateRangeTo: string;
-  patientAbhaAddress: string;
-}
-
-/** P9 -- raises a dedicated PATRQT self-view consent request. 202 Accepted expected, empty body on success. */
-export function requestSelfViewConsent(body: RequestSelfViewConsentBody): Promise<ApiResult<AbdmPassthrough>> {
-  return apiRequest<AbdmPassthrough>("/phr/data-flow/self-view-consent", { method: "POST", body });
-}
-
 export interface TriggerConsentFetchBody {
   consentId: string;
   hiuId: string;
@@ -703,22 +691,118 @@ export function triggerConsentFetch(body: TriggerConsentFetchBody): Promise<ApiR
   return apiRequest<AbdmPassthrough>("/phr/data-flow/trigger-consent-fetch", { method: "POST", body });
 }
 
-export interface EnsureSelfViewAutoApproveBody {
+// ---------------------------------------------------------------------------
+// P19 -- Health Locker. The only route by which a patient's records reach
+// this app. Replaces the removed self-view endpoints (self-view-consent,
+// ensure-self-view-auto-approve, discover-self-view-consents) and
+// ensure-self-subscription. See aegle_phr/phr/locker_service.py's banner.
+// ---------------------------------------------------------------------------
+
+export interface LockerStatusBody {
   xToken: string;
+  patientAbhaAddress: string;
 }
 
-/** P11 -- sets up ABDM's real Consent Auto-Approval standing policy for self-view (create-pin/verify-pin/auto-approve, a 3-call sequence run server-side) so a self-view request raised afterward should auto-grant instead of sitting REQUESTED forever. See data_flow.py's own ensure_self_view_auto_approve() docstring. Meant to be called once per patient per session, before the first self-view raise -- see HomeScreen.tsx's own call site. */
-export function ensureSelfViewAutoApprove(body: EnsureSelfViewAutoApproveBody): Promise<ApiResult<AbdmPassthrough>> {
-  return apiRequest<AbdmPassthrough>("/phr/data-flow/ensure-self-view-auto-approve", { method: "POST", body });
+export interface LockerStatus {
+  ok: boolean;
+  lockerId: string;
+  lockerConfigured: boolean;
+  lockerPresent: boolean;
+  lockerActive: boolean;
+  subscriptionUsable: boolean;
+  /** The single field the opt-in screen gates on. */
+  needsOptIn: boolean;
+  optInState: "PENDING" | "ALLOWED" | "DECLINED" | "OPTED_OUT" | string;
+  subscription: unknown;
+  autoApproval: unknown;
+  error: string | null;
 }
 
-export interface DiscoverSelfViewConsentsBody {
+/** Is this patient's locker set up and usable? Read-only -- creates nothing. */
+export function getLockerStatus(body: LockerStatusBody): Promise<ApiResult<LockerStatus>> {
+  return apiRequest<LockerStatus>("/phr/locker/status", { method: "POST", body });
+}
+
+export interface LockerSetupBody {
   xToken: string;
+  patientAbhaAddress: string;
 }
 
-/** P13 -- finds self-view (PATRQT) consents ABDM already granted on its own (outside this project's own auto-approve/raise flow entirely -- confirmed live, hiu.id "sbx_001", requester "SELF") and registers each new one with repo/'s own hiu_consent_repository via trigger_consent_fetch(), so request_health_information() can actually use it afterward. See data_flow.py's own discover_self_view_consents() docstring for the full story. Safe to call repeatedly -- already-known consents are skipped. */
-export function discoverSelfViewConsents(body: DiscoverSelfViewConsentsBody): Promise<ApiResult<AbdmPassthrough>> {
-  return apiRequest<AbdmPassthrough>("/phr/data-flow/discover-self-view-consents", { method: "POST", body });
+/** 8.3.18 Setup Locker -- call ONLY after the patient presses Allow. One call creates the already-granted subscription AND its consent auto-approval policy. ABDM-1151 ("already setup") comes back as ok:true with alreadySetUp:true. */
+export function setupPatientLocker(body: LockerSetupBody): Promise<ApiResult<AbdmPassthrough>> {
+  return apiRequest<AbdmPassthrough>("/phr/locker/setup", { method: "POST", body });
+}
+
+export interface LockerDeclineBody {
+  patientAbhaAddress: string;
+  /** true = opting out after previously allowing; false = "Not now". */
+  optedOut?: boolean;
+}
+
+/** Records the patient's "Not now" / opt-out so the automation stops asking and never silently re-subscribes them. */
+export function declineLocker(body: LockerDeclineBody): Promise<ApiResult<AbdmPassthrough>> {
+  return apiRequest<AbdmPassthrough>("/phr/locker/decline", { method: "POST", body });
+}
+
+export interface LockerInitialSyncBody {
+  xToken: string;
+  patientAbhaAddress: string;
+  force?: boolean;
+}
+
+/** One-off backfill: raises a locker consent for care contexts linked BEFORE the subscription existed (alerts only cover what is linked after). Safe to call repeatedly -- it no-ops once DONE unless force is set. */
+export function runLockerInitialSync(body: LockerInitialSyncBody): Promise<ApiResult<AbdmPassthrough>> {
+  return apiRequest<AbdmPassthrough>("/phr/locker/initial-sync", { method: "POST", body });
+}
+
+/** One care context the locker holds, with its decrypted FHIR bundle. */
+export interface LockerRecord {
+  careContextReference: string;
+  hipId: string | null;
+  consentId: string | null;
+  transactionId: string | null;
+  receivedAt: string | null;
+  bundle: Record<string, unknown> | null;
+}
+
+export interface LockerRecords {
+  lockerId: string;
+  optInState: string | null;
+  initialSyncState: string | null;
+  count: number;
+  records: LockerRecord[];
+}
+
+export interface LockerRecordsBody {
+  patientAbhaAddress: string;
+  /** Optional. Only used to START the one-off backfill if it has never run. */
+  xToken?: string;
+}
+
+/**
+ * P20 -- everything the locker currently holds for this patient, read from
+ * ITS OWN storage. No ABDM round trip: a Health Locker is entitled to keep
+ * the records for the life of the consent behind them, which is what makes
+ * a login a database read instead of one data request per hospital.
+ *
+ * Sweeps lapsed consents BEFORE returning anything, so a record whose
+ * retention deadline has passed can never be served even once. If the
+ * one-off backfill has never run and xToken is supplied, it starts in the
+ * background and `initialSyncState` comes back RUNNING -- poll for it
+ * rather than blocking the login.
+ */
+export function getLockerRecords(body: LockerRecordsBody): Promise<ApiResult<AbdmPassthrough>> {
+  return apiRequest<AbdmPassthrough>("/phr/locker/records", { method: "POST", body });
+}
+
+export interface LockerAlertsBody {
+  patientAbhaAddress: string;
+  limit?: number;
+}
+
+/** This patient's locker alert log -- every LINK/DATA event and how far it got (RECEIVED -> CONSENT_REQUESTED -> CONSENT_GRANTED -> DATA_REQUESTED -> DATA_RECEIVED, or FAILED with a reason). */
+export function getLockerAlerts(body: LockerAlertsBody): Promise<ApiResult<AbdmPassthrough>> {
+  return apiRequest<AbdmPassthrough>("/phr/locker/alerts", { method: "POST", body });
 }
 
 // ---------------------------------------------------------------------------
@@ -726,15 +810,6 @@ export function discoverSelfViewConsents(body: DiscoverSelfViewConsentsBody): Pr
 // own module banner for the full URL/body provenance. Every field name
 // below matches that module's own function signatures exactly.
 // ---------------------------------------------------------------------------
-
-export interface EnsureSelfSubscriptionBody {
-  patientAbhaAddress: string;
-}
-
-/** P13 -- 8.3.2 with hiu.id=CLIENT_ID, the subscription-equivalent of consent auto-approve. No xToken -- REQUESTER-role call, confirmed via Postman to need no patient session token. See data_flow.py's own ensure_self_subscription() docstring. */
-export function ensureSelfSubscription(body: EnsureSelfSubscriptionBody): Promise<ApiResult<AbdmPassthrough>> {
-  return apiRequest<AbdmPassthrough>("/phr/subscription/ensure-self-subscription", { method: "POST", body });
-}
 
 export interface GetLocalSubscriptionsBody {
   patientAbhaAddress: string;

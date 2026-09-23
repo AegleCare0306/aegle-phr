@@ -104,27 +104,36 @@ JWT, archives the payload verbatim to `callback_log`, logs via
 `flow_logger`, and returns the standard ack `{"status": "OK"}`. Real
 per-callback handling arrives in P3.
 
-## Callback paths this repo deliberately does NOT own
-
-These four are already registered and handled by the existing backend's M3
-HIU code (`repo/server/callbacks/router.py`):
+## The five HIU callback paths — owned per deployment (P20)
 
 ```
 /api/v3/hiu/consent/request/on-init
 /api/v3/hiu/consent/request/notify
 /api/v3/hiu/consent/on-fetch
 /api/v3/hiu/health-information/on-request
+/api/v3/hiu/health-information/push
 ```
 
-**Do not add them here** without an explicit decision about which app owns
-the flow. Two routers in one FastAPI app cannot both own a path — whichever
-is included first wins, silently, and the other handler simply never runs.
-Adding one would work in standalone PHR testing and then quietly break, or
-half-work, the moment the two apps are mounted together. If the PHR needs to
-participate in those flows, route them in *one* place and fan out.
+Two routers in one FastAPI app cannot both own a path — whichever is
+included first wins, silently, and the other handler never runs. That is
+still true. What changed in P20 is that there are now two deployments, and
+the right owner differs between them:
 
-The list is also kept as data in `aegle_phr/callbacks/router.py`
-(`FORBIDDEN_PATHS`) so it can be asserted against.
+| Deployment | `ABDM_LOCKER_OWNS_HIU_CALLBACKS` | Owner |
+|---|---|---|
+| Mounted inside `repo/server/main.py` (shared client id, port 8000) | `false` (default) | `repo/server/callbacks/router.py` |
+| Standalone locker (own client id, own callback URL, port 8001) | `true` | this repo, `aegle_phr/callbacks/hiu_services.py` |
+
+Before P20 this repo could never own them, which is exactly what made the
+PHR app unable to run without a HIP/HIU backend beside it: it could raise a
+consent and then never learn the outcome, so locker alerts stalled at
+`CONSENT_REQUESTED`. Under `true` the whole chain — consent init → on-init →
+notify → fetch → on-fetch → data request → on-request → push → decrypt —
+runs inside this app, against its own `locker_*` tables.
+
+The paths are kept as data in `aegle_phr/callbacks/router.py`
+(`HIU_CALLBACK_ROUTES`) so a test can assert they are absent in the mounted
+deployment and present in the standalone one.
 
 ## Database
 
