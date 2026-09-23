@@ -26,7 +26,7 @@ from aegle_phr.db import check_connection
 from aegle_phr.phr import locker_hiu_repository, locker_repository, locker_service, retention
 from aegle_phr.phr import abha_address_creation, abha_card, aadhaar_enrollment, consent, data_flow, email_verification, enrollment, links, login, mobile_linking, profile, profile_link, providers, subscription, uil
 from aegle_phr.phr.subscription_repository import get_all_for_patient as get_all_local_subscriptions_for_patient
-from aegle_phr.phr.uil_repository import get_by_request_id as get_uil_request_by_id, save_new_request as save_new_uil_request
+from aegle_phr.phr.uil_repository import get_by_request_id as get_uil_request_by_id, save_new_request as save_new_uil_request, update_by_request_id as update_uil_request
 from aegle_phr.phr.enrollment import AbdmResult
 from aegle_phr.phr.schemas import (
     ApproveConsentRequestBody,
@@ -124,6 +124,27 @@ def _passthrough(result: AbdmResult) -> dict:
         "body": result.body,
         "error": result.error,
     }
+
+
+def _record_uil_failure(request_id: str, payload: dict) -> dict:
+    """
+    Marks a UIL row FAILED when its outbound call was never accepted.
+
+    All three UIL routes save a PENDING row BEFORE calling ABDM, so that a
+    callback arriving before our own HTTP response still has something to
+    correlate against. The gap was the other branch: when ABDM rejects the
+    call outright there will never BE a callback, and nothing moved the row
+    off PENDING -- leaving it permanently indistinguishable from one
+    genuinely in flight.
+
+    Confirmed live 2026-09-23: four rejected discovers from 2026-09-05 were
+    still sitting PENDING eighteen days later, alongside a fresh one
+    rejected as a duplicate. Returns the payload unchanged so callers can
+    `return _record_uil_failure(...)` directly.
+    """
+    if payload.get("ok") is not True:
+        update_uil_request(request_id, status="FAILED", detail={"response": payload.get("body")})
+    return payload
 
 
 def _passthrough_aadhaar_enrol(result: aadhaar_enrollment.AbdmResult) -> dict:
@@ -671,7 +692,7 @@ def build_app_api_router(settings: Settings) -> APIRouter:
         save_new_uil_request(request_id, stage="discover", hip_id=body.hipId, abha_address=body.abhaAddress, detail={"hipId": body.hipId, "abhaAddress": body.abhaAddress})
         payload = _passthrough(uil.discover(settings, body.xToken, body.hipId, body.abhaAddress, request_id=request_id))  # type: ignore[arg-type]
         payload["requestId"] = request_id
-        return payload
+        return _record_uil_failure(request_id, payload)
 
     @router.post("/phr/uil/link-init", summary="10.3.5 -- Link init -- SENDS A REAL OTP -- 202 Accepted, real answer via the on-init callback")
     def uil_link_init(body: UilLinkInitBody) -> dict:
@@ -679,7 +700,7 @@ def build_app_api_router(settings: Settings) -> APIRouter:
         save_new_uil_request(request_id, stage="link_init", hip_id=body.hipId, abha_address=body.abhaAddress, detail={"transactionId": body.transactionId})
         payload = _passthrough(uil.link_init(settings, body.xToken, body.transactionId, body.abhaAddress, body.patientMatches, request_id=request_id))  # type: ignore[arg-type]
         payload["requestId"] = request_id
-        return payload
+        return _record_uil_failure(request_id, payload)
 
     @router.post("/phr/uil/link-confirm", summary="10.3.9 -- Link confirm (the real OTP) -- 202 Accepted, real answer via the on-confirm callback")
     def uil_link_confirm(body: UilLinkConfirmBody) -> dict:
@@ -687,7 +708,7 @@ def build_app_api_router(settings: Settings) -> APIRouter:
         save_new_uil_request(request_id, stage="link_confirm", hip_id=body.hipId, abha_address=body.abhaAddress, detail={"linkRefNumber": body.linkRefNumber})
         payload = _passthrough(uil.link_confirm(settings, body.xToken, body.token, body.linkRefNumber, request_id=request_id))  # type: ignore[arg-type]
         payload["requestId"] = request_id
-        return payload
+        return _record_uil_failure(request_id, payload)
 
     @router.get("/phr/uil/result", summary="Poll one UilLinkRequest row by requestId -- the frontend's own async-wait mechanism for all three calls above")
     def uil_result(requestId: str = Query(min_length=1)) -> dict:
