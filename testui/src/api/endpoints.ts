@@ -789,6 +789,17 @@ export interface LockerRecordsBody {
   patientAbhaAddress: string;
   /** Optional. Only used to START the one-off backfill if it has never run. */
   xToken?: string;
+  /**
+   * Include each record's full FHIR bundle. DEFAULTS TO FALSE SERVER-SIDE,
+   * and callers should leave it that way when POLLING.
+   *
+   * A bundle is 23 KB - 795 KB; a normal history makes the full response
+   * ~2 MB. Measured on the tunnel 2026-10-03: 24 polls moved 49 MB, which
+   * is four hours of one open tab against a 1 GB monthly allowance. Ask
+   * for bundles once on load, then poll metadata-only and re-fetch in full
+   * only when the metadata shows a care context you do not already hold.
+   */
+  includeBundles?: boolean;
 }
 
 /**
@@ -1029,4 +1040,48 @@ export function uilLinkConfirm(body: UilLinkConfirmBody): Promise<ApiResult<Abdm
  */
 export function getUilResult(requestId: string): Promise<ApiResult<AbdmPassthrough>> {
   return apiRequest<AbdmPassthrough>(`/phr/uil/result?requestId=${encodeURIComponent(requestId)}`);
+}
+
+// --- Scan & Share, patient side (spec section 5, P22) ----------------------
+// The other end of the facility-side flow repo/ builds. Every response here
+// is AbdmPassthrough: NOTHING in this chunk declares a shape for ABDM's own
+// reply, because no saved example of either the share response or
+// getTokenDetails exists anywhere -- see aegle_phr/phr/profile_share.py.
+
+export interface ScanShareParseBody { scanned: string }
+
+/**
+ * Pure parsing of the scanned string, plus a best-effort facility-name
+ * lookup. No share happens here -- this is what lets the consent step name
+ * the facility before the patient agrees to anything.
+ *
+ * 400 with a readable message when the QR carries no hip-id.
+ */
+export function scanShareParse(body: ScanShareParseBody): Promise<ApiResult<AbdmPassthrough>> {
+  return apiRequest<AbdmPassthrough>("/phr/scan-share/parse", { method: "POST", body });
+}
+
+export interface ScanShareShareBody {
+  xToken: string;
+  hipId: string;
+  counterId: string;
+  /** The EXACT object the consent step displayed -- see ScanShareScreen. */
+  patient: Record<string, unknown>;
+}
+
+/** Shares the patient's profile with the scanned facility. Response shape UNCONFIRMED. */
+export function scanShareShare(body: ScanShareShareBody): Promise<ApiResult<AbdmPassthrough>> {
+  return apiRequest<AbdmPassthrough>("/phr/scan-share/share", { method: "POST", body });
+}
+
+/** Polls our own ProfileShareRequest row -- written by EITHER mechanism. */
+export function getScanShareResult(requestId: string): Promise<ApiResult<AbdmPassthrough>> {
+  return apiRequest<AbdmPassthrough>(`/phr/scan-share/result?requestId=${encodeURIComponent(requestId)}`);
+}
+
+export interface ScanShareTokenDetailsBody { xToken: string; limit?: number }
+
+/** CANDIDATE B -- ABDM's own token list. Response shape UNCONFIRMED, returned verbatim. */
+export function scanShareTokenDetails(body: ScanShareTokenDetailsBody): Promise<ApiResult<AbdmPassthrough>> {
+  return apiRequest<AbdmPassthrough>("/phr/scan-share/token-details", { method: "POST", body });
 }

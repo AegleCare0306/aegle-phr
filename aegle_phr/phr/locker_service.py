@@ -384,6 +384,35 @@ _CONSENT_LOOKBACK_DAYS = 365 * 5
 # How long the locker keeps fetched data before ABDM expects it erased.
 _DATA_ERASE_DAYS = 365
 
+# How far in the past dateRange.to is placed, rather than sending "now".
+#
+# THIS IS NOT PADDING, IT IS THE FIX FOR A REAL OUTAGE. ABDM validates
+# dateRange.to against ITS OWN clock and rejects anything that is even
+# marginally in its future:
+#
+#     ABDM-9999 "Invalid from/to date and Date must be a present/before date"
+#
+# Sending to = now looks safe and is not. The value is computed here, then
+# the payload is serialised, a gateway token is fetched, the request
+# crosses the network, and only then does ABDM compare it -- against a
+# clock that is not ours. A sub-second difference between the two machines
+# is enough to make our "now" their "future", and that difference drifts.
+#
+# Confirmed live, from abdm_call_log: eleven consent requests on
+# 2026-09-23 were accepted with to = now, and every one on 2026-09-29 was
+# rejected with the error above. Identical code, identical payload shape,
+# different day. The margin between to and the call going out was
+# 192-579ms on the day it worked and 117-232ms on the day it did not --
+# overlapping ranges, which is exactly what a drifting skew looks like and
+# exactly why "now" can never be relied on here.
+#
+# Two minutes is far wider than any plausible skew, and costs nothing: it
+# narrows a five-year look-back by 0.00004%, and the alert that triggered
+# this consent is itself seconds old, so no record can fall in the gap.
+# repo/server/utils.py's generate_safe_past_timestamp() already encodes
+# this same lesson for doneAt; this is the same trap in a second place.
+_CONSENT_TO_SAFETY_MARGIN_SECONDS = 120
+
 
 def _consent_date_range(patient_locker: dict[str, Any] | None) -> tuple[str, str]:
     """
@@ -406,7 +435,10 @@ def _consent_date_range(patient_locker: dict[str, Any] | None) -> tuple[str, str
     tests 5 and 7 settle which reading is right.
     """
     now = datetime.now(timezone.utc)
-    start = now - timedelta(days=_CONSENT_LOOKBACK_DAYS)
+    # NEVER "now" -- see _CONSENT_TO_SAFETY_MARGIN_SECONDS for the outage
+    # this caused and why our clock cannot be trusted against ABDM's.
+    end = now - timedelta(seconds=_CONSENT_TO_SAFETY_MARGIN_SECONDS)
+    start = end - timedelta(days=_CONSENT_LOOKBACK_DAYS)
 
     period_from = _parse_iso((patient_locker or {}).get("periodFrom"))
     if period_from is not None and period_from > start:
@@ -416,7 +448,7 @@ def _consent_date_range(patient_locker: dict[str, Any] | None) -> tuple[str, str
             f"policy start {_iso(period_from)}; requesting the full range anyway "
             f"so a non-approval is visible rather than silently narrowed."
         )
-    return _iso(start), _iso(now)
+    return _iso(start), _iso(end)
 
 
 def _raise_locker_consent(
@@ -449,16 +481,31 @@ def _raise_locker_consent(
     local = repo.get_patient_locker(patient_id, locker_id)
     date_from, date_to = _consent_date_range(local)
 
+    # DEDUPED, because the alert genuinely repeats itself. Observed live
+    # 2026-09-29 (abdm_call_log 2569): an INITIAL_SYNC alert carrying two
+    # context entries produced FOUR careContexts, ENC9002AUC03 and
+    # ENC9002AUC04 twice each, because this loop flattened both entries
+    # without checking. ABDM did not complain about it that day -- the date
+    # bug rejected the request first -- so this would have surfaced later
+    # as a mystery rather than now as a one-line fix. Keyed on the pair,
+    # not the reference alone: the same care context under two different
+    # patientReferences is two real rows, not a duplicate.
     care_contexts: list[dict[str, str]] = []
+    seen_contexts: set[tuple[str | None, str]] = set()
     for ctx in contexts or []:
         if not isinstance(ctx, dict):
             continue
         for cc in ctx.get("careContexts") or []:
-            if isinstance(cc, dict) and cc.get("careContextReference"):
-                care_contexts.append({
-                    "patientReference": cc.get("patientReference"),
-                    "careContextReference": cc.get("careContextReference"),
-                })
+            if not isinstance(cc, dict) or not cc.get("careContextReference"):
+                continue
+            key = (cc.get("patientReference"), cc["careContextReference"])
+            if key in seen_contexts:
+                continue
+            seen_contexts.add(key)
+            care_contexts.append({
+                "patientReference": cc.get("patientReference"),
+                "careContextReference": cc.get("careContextReference"),
+            })
 
     try:
         result = hiu_client.initiate_consent_request(
@@ -712,3 +759,118 @@ def run_initial_sync(settings: Settings, x_auth_token: str, patient_id: str, for
     log_phase(f"Initial sync for {patient_id}: {len(outcomes)} hospital(s), failed={any_failed}")
     return {"ok": not any_failed, "hips": outcomes,
             "initialSyncState": repo.SYNC_FAILED if any_failed else repo.SYNC_DONE}
+
+
+# =============================================================================
+# Recovery -- re-driving what failed
+# =============================================================================
+
+# How long a failed alert is left alone before it may be retried. Without
+# this, every login would re-drive the same alerts, so a genuinely broken
+# one would hammer ABDM once per page load.
+_RETRY_COOLDOWN_SECONDS = 300
+
+# Most alerts re-driven per call, newest first. A patient with a long
+# history of failures should not turn one login into fifty ABDM round
+# trips; the rest are picked up on the next login.
+_RETRY_BATCH = 10
+
+
+def retry_failed_alerts(settings: Settings, patient_id: str, limit: int = _RETRY_BATCH) -> dict[str, Any]:
+    """
+    Re-drives this patient's FAILED alerts.
+
+    WHY THIS EXISTS -- A REAL OUTAGE, 2026-09-29. Until this function there
+    was no retry path anywhere in the locker: an alert that failed went to
+    FAILED and stayed there for good. That made every transient failure
+    permanent, and it is what turned one bad consent request into
+    "I linked my records and the app never showed them, and logging out and
+    back in did nothing."
+
+    The specific case: patient 91770048252272@sbx completed a UIL link at
+    10:01:17, ABDM's LINK alert arrived at 10:01:19, and the consent
+    request behind it was rejected 400 by the dateRange.to bug (see
+    _CONSENT_TO_SAFETY_MARGIN_SECONDS). That alert -- and three initial-sync
+    alerts for the same patient -- then sat FAILED indefinitely with no
+    mechanism, manual or automatic, able to move them.
+
+    A fix for the 400 alone would NOT have recovered that patient. The
+    records only become reachable because something re-drives the alert.
+    That is the difference between fixing a bug and fixing the glitch.
+
+    BOUNDED, so this cannot become a retry storm: an alert is skipped if it
+    was last touched within _RETRY_COOLDOWN_SECONDS, and at most `limit`
+    are attempted per call. Alerts already past consent (CONSENT_REQUESTED
+    and later) are NOT retried here -- those are waiting on an ABDM
+    callback, and re-raising would duplicate a live consent.
+    """
+    now = datetime.now(timezone.utc)
+    attempted: list[dict[str, Any]] = []
+
+    for alert in repo.get_alerts_for_patient(patient_id, limit=100):
+        if len(attempted) >= limit:
+            break
+        if alert.get("processingState") != repo.ALERT_FAILED:
+            continue
+
+        updated = _parse_iso(alert.get("updatedAt"))
+        if updated is not None and (now - updated).total_seconds() < _RETRY_COOLDOWN_SECONDS:
+            continue
+
+        event_id = alert.get("eventId")
+        category = (alert.get("category") or "").upper()
+        hip_id = alert.get("hipId")
+        contexts = alert.get("contexts") or []
+
+        if not event_id or not hip_id:
+            # Nothing to replay against -- leave it FAILED and visible
+            # rather than pretending it was handled.
+            continue
+
+        # NEVER RETRY ANOTHER LOCKER'S ALERT. An alert raised under a
+        # previous registration cannot be re-driven under this one: the
+        # consent would go out as the wrong HIU, against a subscription and
+        # auto-approval policy that do not cover it. Caught before this
+        # shipped -- aayushchordia4611@sbx still carries a FAILED alert
+        # from locker IN2410002590, deliberately left as a tombstone with
+        # its reason recorded, and without this guard every login for that
+        # patient would have re-raised it against IN3310002290 forever.
+        alert_locker = alert.get("lockerId")
+        if alert_locker and alert_locker != settings.abdm_health_locker_id:
+            continue
+
+        log_phase(
+            f"Retrying FAILED locker alert {event_id} ({category or 'UNKNOWN'}) for "
+            f"{patient_id} hip={hip_id} -- previous failure: {alert.get('failureReason')}"
+        )
+
+        # Back to RECEIVED first: if the retry throws, the alert must not be
+        # left reading FAILED-with-a-stale-reason from the previous attempt.
+        repo.update_alert_state(event_id, repo.ALERT_RECEIVED)
+
+        try:
+            # INITIAL_SYNC alerts are LINK-shaped -- a hospital and the care
+            # contexts it holds -- so they re-drive down the same path.
+            if category == "DATA":
+                process_data_alert(settings, patient_id, hip_id, contexts, event_id)
+            else:
+                process_link_alert(settings, patient_id, hip_id, contexts, event_id)
+            outcome = "retried"
+        except Exception as exc:  # never let one bad alert stop the rest
+            repo.update_alert_state(event_id, repo.ALERT_FAILED,
+                                    failure_reason=f"retry raised {type(exc).__name__}: {exc}")
+            log_error(f"Retry of locker alert {event_id} raised: {type(exc).__name__}: {exc}")
+            outcome = "raised"
+
+        after = repo.get_alert(event_id)
+        attempted.append({
+            "eventId": event_id,
+            "category": category,
+            "hipId": hip_id,
+            "outcome": outcome,
+            "state": (after or {}).get("processingState"),
+        })
+
+    if attempted:
+        log_phase(f"Locker retry for {patient_id}: {len(attempted)} alert(s) re-driven.")
+    return {"ok": True, "retried": len(attempted), "alerts": attempted}

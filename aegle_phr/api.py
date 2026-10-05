@@ -16,7 +16,7 @@ Everything here obeys the mountability rules:
   - every handler a plain `def` (see aegle_phr/db.py for why)
 """
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 
 from abdm_core.http import generate_request_id
 
@@ -24,9 +24,10 @@ from aegle_phr.access import api_key_dependency
 from aegle_phr.callbacks.router import build_callback_router
 from aegle_phr.db import check_connection
 from aegle_phr.phr import locker_hiu_repository, locker_repository, locker_service, retention
-from aegle_phr.phr import abha_address_creation, abha_card, aadhaar_enrollment, consent, data_flow, email_verification, enrollment, links, login, mobile_linking, profile, profile_link, providers, subscription, uil
+from aegle_phr.phr import abha_address_creation, abha_card, aadhaar_enrollment, consent, data_flow, email_verification, enrollment, links, login, mobile_linking, profile, profile_link, profile_share, providers, subscription, uil
 from aegle_phr.phr.subscription_repository import get_all_for_patient as get_all_local_subscriptions_for_patient
 from aegle_phr.phr.uil_repository import get_by_request_id as get_uil_request_by_id, save_new_request as save_new_uil_request, update_by_request_id as update_uil_request
+from aegle_phr.phr.profile_share_repository import get_by_request_id as get_share_request_by_id, save_new_share, update_by_request_id as update_share_request
 from aegle_phr.phr.enrollment import AbdmResult
 from aegle_phr.phr.schemas import (
     ApproveConsentRequestBody,
@@ -87,6 +88,9 @@ from aegle_phr.phr.schemas import (
     GetLocalSubscriptionsBody,
     RequestUpdateMobileOtpBody,
     RevokeConsentsBody,
+    ScanShareParseBody,
+    ScanShareShareBody,
+    ScanShareTokenDetailsBody,
     SearchProvidersBody,
     SearchUserBody,
     SetAutoApproveStateBody,
@@ -577,13 +581,38 @@ def build_app_api_router(settings: Settings) -> APIRouter:
         sync_state = (local or {}).get("initialSyncState")
         opted_in = (local or {}).get("optInState") == locker_repository.OPT_IN_ALLOWED
 
-        if opted_in and body.xToken and sync_state == locker_repository.SYNC_NOT_STARTED:
+        # SELF-HEALS, because the patient's instinct is to log out and back
+        # in and that must actually do something.
+        #
+        # THIS USED TO READ `== SYNC_NOT_STARTED` ALONE, and that was the
+        # bug behind "I linked my records, the app never showed them, and
+        # logging out and in again changed nothing" (2026-09-29). A sync
+        # that FAILED was excluded by that condition, so the one action a
+        # patient would naturally take was a no-op for precisely the
+        # accounts that needed it. A failed sync is exactly the state that
+        # should be retried.
+        if opted_in and body.xToken and sync_state in (
+            locker_repository.SYNC_NOT_STARTED,
+            locker_repository.SYNC_FAILED,
+        ):
             background.add_task(
                 locker_service.run_initial_sync, settings, body.xToken, patient_id,
             )
             sync_state = locker_repository.SYNC_RUNNING
 
-        records = locker_hiu_repository.get_records_for_patient(patient_id)
+        # And re-drive anything that died on the way. Bounded by a cooldown
+        # and a batch cap inside retry_failed_alerts(), so a genuinely
+        # broken alert cannot turn each page load into an ABDM storm.
+        # Backgrounded for the same reason the sync is: this is the login
+        # read and it must stay fast.
+        if opted_in:
+            background.add_task(locker_service.retry_failed_alerts, settings, patient_id)
+
+        # Bundles only when asked for -- see LockerRecordsBody. A polled
+        # endpoint must not re-send megabytes the caller already holds.
+        records = locker_hiu_repository.get_records_for_patient(
+            patient_id, include_bundles=body.includeBundles,
+        )
         return {
             "ok": True,
             "status": 200,
@@ -592,6 +621,7 @@ def build_app_api_router(settings: Settings) -> APIRouter:
                 "optInState": (local or {}).get("optInState"),
                 "initialSyncState": sync_state,
                 "count": len(records),
+                "includesBundles": body.includeBundles,
                 "records": records,
             },
             "error": None,
@@ -714,6 +744,88 @@ def build_app_api_router(settings: Settings) -> APIRouter:
     def uil_result(requestId: str = Query(min_length=1)) -> dict:
         row = get_uil_request_by_id(requestId)
         return {"ok": True, "status": 200, "body": row, "error": None}
+
+    # -- Scan & Share, patient side (spec section 5, P22) --------------------
+    # The other end of repo/'s P21: the patient scans a facility's counter
+    # QR, shares their profile through the CM, and gets an OPD queue token
+    # back. Structured exactly like the four UIL routes above -- generate our
+    # own REQUEST-ID, save the row BEFORE calling, poll a result route --
+    # because it is the same async shape for the same reason.
+    #
+    # THE TOKEN'S RETURN PATH IS AN OPEN QUESTION, AND BOTH ANSWERS ARE
+    # BUILT. Either ABDM calls /api/v3/hiu/patient/on-share (Candidate A,
+    # aegle_phr/callbacks/profile_share_services.py) or the patient's app
+    # polls getTokenDetails (Candidate B, the route below). Both write the
+    # SAME ProfileShareRequest row and stamp `source`, so whichever arrives
+    # first wins and the UI shows the token either way. The UI leans on the
+    # poll, because it is at least a documented endpoint with a saved
+    # request, whereas the callback's payload shape has never been seen.
+    # See aegle_phr/phr/profile_share.py's banner.
+
+    @router.post("/phr/scan-share/parse", summary="Read hip-id/counter-id out of a scanned counter QR -- pure local parsing, plus a best-effort facility-name lookup")
+    def scan_share_parse(body: ScanShareParseBody) -> dict:
+        try:
+            parsed = profile_share.parse_scanned_qr(body.scanned)
+        except profile_share.ScannedQrError as exc:
+            # A 400 whose message names what was missing -- this is the one
+            # error a patient will actually hit (pointing the camera at the
+            # wrong code), so it is worth saying plainly rather than as a
+            # validation blob.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Best-effort only: the share works perfectly well without a display
+        # name, so a directory lookup that fails, times out or returns an
+        # unexpected shape must never fail the parse. Null and carry on.
+        facility_name = None
+        try:
+            lookup = providers.get_provider(settings, parsed["hipId"])
+            if lookup.ok and isinstance(lookup.body, dict):
+                facility_name = lookup.body.get("identifier", {}).get("name") if isinstance(lookup.body.get("identifier"), dict) else None
+                facility_name = facility_name or lookup.body.get("name")
+        except Exception:  # noqa: BLE001 -- see above, this is deliberately total
+            facility_name = None
+
+        return {
+            "ok": True,
+            "status": 200,
+            "body": {**parsed, "facilityName": facility_name},
+            "error": None,
+        }
+
+    @router.post("/phr/scan-share/share", summary="Share the patient's profile with the scanned facility -- response shape UNCONFIRMED, no saved example anywhere")
+    def scan_share_share(body: ScanShareShareBody) -> dict:
+        request_id = generate_request_id()
+        abha_address = str(body.patient.get("abhaAddress") or "")
+        # Saved BEFORE the call, same ordering and same reason as the three
+        # UIL routes: a callback can arrive before our own HTTP response.
+        save_new_share(
+            request_id,
+            hip_id=body.hipId,
+            counter_id=body.counterId,
+            abha_address=abha_address,
+            detail={"hipId": body.hipId, "counterId": body.counterId},
+        )
+        payload = _passthrough(
+            profile_share.share_profile(settings, body.xToken, body.hipId, body.counterId, body.patient, request_id=request_id)  # type: ignore[arg-type]
+        )
+        payload["requestId"] = request_id
+        update_share_request(
+            request_id,
+            status="SHARED" if payload.get("ok") else "ERROR",
+            detail={"response": payload.get("body")},
+        )
+        return payload
+
+    @router.get("/phr/scan-share/result", summary="Poll one ProfileShareRequest row by requestId -- the frontend's own async-wait mechanism")
+    def scan_share_result(requestId: str = Query(min_length=1)) -> dict:
+        row = get_share_request_by_id(requestId)
+        return {"ok": True, "status": 200, "body": row, "error": None}
+
+    @router.post("/phr/scan-share/token-details", summary="CANDIDATE B -- ask ABDM for this patient's share tokens. Response shape UNCONFIRMED, returned VERBATIM")
+    def scan_share_token_details(body: ScanShareTokenDetailsBody) -> dict:
+        # Returned untouched on purpose: no saved response for this call
+        # exists anywhere, so reshaping it would mean inventing a contract.
+        return _passthrough(profile_share.get_token_details(settings, body.xToken, body.limit))  # type: ignore[arg-type]
 
     # -- ABHA Address creation for an EXISTING ABHA Number (P1-H) -------------
     # Aayush's third top-level entry point, distinct from Login and Signup --

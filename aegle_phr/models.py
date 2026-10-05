@@ -705,3 +705,86 @@ class LockerHealthInformation(Base):
             f"<LockerHealthInformation id={self.id} transaction_id={self.transaction_id!r} "
             f"page={self.page_number}/{self.page_count} status={self.status!r}>"
         )
+
+
+class ProfileShareRequest(Base):
+    """
+    P22 -- Scan & Share (spec section 5), PATIENT side: one row per
+    outbound profile share, from the moment we send it to the moment a
+    queue token comes back.
+
+    Same role UilLinkRequest above plays for User-Initiated Linking, and
+    for the same two reasons: the frontend has no websocket, so it polls
+    GET /phr/scan-share/result keyed on request_id; and an inbound
+    callback needs something local to correlate against.
+
+    WHY `source` EXISTS. There are TWO candidate mechanisms for the token
+    coming back and nobody has documented which one is real, so both are
+    built (see aegle_phr/phr/profile_share.py's own banner):
+
+        CALLBACK  /api/v3/hiu/patient/on-share fired and carried a token
+        POLL      getTokenDetails returned one
+
+    Whichever arrives first writes the row and stamps how it got there.
+    That column is not bookkeeping -- it is the answer to the open
+    question, recorded per share, and after a handful of real scans it is
+    what settles which mechanism to keep.
+
+    WHY `token_expiry` IS Text AND NOT AN INTERVAL OR A TIMESTAMP. The
+    field's own semantics are unresolved upstream: repo/'s P21 records that
+    both ABDM Postman samples send the literal string "1800" (reading as
+    seconds) while NHA's own reference wrapper stringifies a LocalDateTime
+    into the same field on one code path, which would emit
+    "2026-09-28T14:03:11". Parsing it here would mean picking one and being
+    silently wrong half the time. Store what arrived; the UI renders it as
+    a duration only when it is all digits, and prints it raw otherwise.
+    """
+
+    __tablename__ = "profile_share_request"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    # Our own REQUEST-ID on the outbound share call -- what a callback
+    # would echo back as response.requestId, and what the frontend polls on.
+    request_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+
+    # Both read straight out of the scanned QR's query string.
+    hip_id: Mapped[str] = mapped_column(Text, nullable=False)
+    counter_id: Mapped[str] = mapped_column(Text, nullable=False)
+
+    abha_address: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Our own tracking words, not an ABDM enum:
+    #   PENDING       saved before the call went out
+    #   SHARED        ABDM accepted the share
+    #   TOKEN_ISSUED  a token number reached us, by either mechanism
+    #   ERROR         the share was rejected
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="PENDING")
+
+    token_number: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_expiry: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # The share response first, then overwritten with the callback payload
+    # once one arrives -- stored verbatim, parsed into columns only for the
+    # two fields above, same "record what arrived" discipline as CallbackLog.
+    detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    # "CALLBACK" | "POLL" -- see this class's own docstring.
+    source: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_profile_share_request_abha_counter", "abha_address", "counter_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ProfileShareRequest id={self.id} request_id={self.request_id!r} "
+            f"status={self.status!r} token_number={self.token_number!r} source={self.source!r}>"
+        )

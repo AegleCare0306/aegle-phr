@@ -674,10 +674,23 @@ def find_erasable_artefacts(now: datetime | None = None, patient_id: str | None 
 # Reading what the locker holds
 # =============================================================================
 
-def get_records_for_patient(patient_id: str) -> list[dict[str, Any]]:
+def get_records_for_patient(patient_id: str, include_bundles: bool = True) -> list[dict[str, Any]]:
     """
     Everything this locker currently holds for one patient, as a flat list
-    of care contexts with their decrypted bundle.
+    of care contexts, with their decrypted bundle when asked for.
+
+    `include_bundles=False` RETURNS METADATA ONLY, AND THAT MATTERS MORE
+    THAN IT LOOKS. A bundle is a full FHIR document -- measured live at
+    23 KB to 795 KB each -- so a patient with a normal history makes this
+    response about 2 MB. The screen polls this endpoint to notice new
+    records arriving, and a 2 MB poll is a real cost paid over and over for
+    data the caller already has.
+
+    Measured on the ngrok tunnel, 2026-10-03: 24 polls moved 49 MB, which
+    on a 1 GB monthly allowance is four hours of one open tab. The bundles
+    are 98% of that and the caller re-receives identical bytes every time.
+    So the default for POLLING is off, and the full payload is fetched once
+    at login and again only when the metadata shows something new.
 
     Reads LOCAL STORAGE ONLY -- no ABDM call. That is the payoff of being a
     locker: the records were collected when they became available, so a
@@ -719,6 +732,10 @@ def get_records_for_patient(patient_id: str) -> list[dict[str, Any]]:
                     "consentId": row.consent_id,
                     "transactionId": row.transaction_id,
                     "receivedAt": row.received_at.isoformat() if row.received_at else None,
-                    "bundle": entry.get("bundle"),
+                    # None, not omitted, when bundles are excluded: the key
+                    # stays present so a caller can always tell "no bundle
+                    # asked for" from "this field does not exist", and the
+                    # TypeScript shape does not change between calls.
+                    "bundle": entry.get("bundle") if include_bundles else None,
                 })
         return records

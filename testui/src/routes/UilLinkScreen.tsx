@@ -74,6 +74,7 @@ import { Callout } from "../components/ui/Callout";
 import { Card, CardBody, CardTitle } from "../components/ui/Card";
 import { EmptyState } from "../components/ui/EmptyState";
 import { PageHeader } from "../components/ui/PageHeader";
+import { markRecentLink } from "../recentLink";
 import { getSessionAddress, getSessionToken } from "../session";
 
 function sleep(ms: number): Promise<void> {
@@ -197,11 +198,102 @@ function extractPatientMatches(detail: unknown): PatientMatch[] {
   return out;
 }
 
-/** Rebuilds the SAME patient[]/careContexts[] shape discover's own callback returned, filtered to only the caller-selected care contexts -- exactly what link-init's own body expects (echoed back, per the spec). A patient entry with none of its contexts selected is dropped entirely. */
+/**
+ * ONE SELECTABLE THING: a single record type belonging to a single visit.
+ *
+ * This is the unit ABDM actually supports. Its on-discover body is grouped
+ * by hiType, and link-init echoes that shape back, so the finest selection
+ * the protocol allows is a (careContext, hiType) pair -- "the Prescription
+ * from the 15 July visit", not "the 15 July visit" as an indivisible lump.
+ */
+interface EncounterItem {
+  hiType: string;
+  patientReference: string;
+  patientDisplay: string;
+}
+
+/** One visit, with every record type the facility holds for it. */
+interface EncounterGroup {
+  reference: string;
+  /** What ABDM sent, e.g. "Essential Hypertension - 2026-07-15". */
+  display: string;
+  /** The condition, split off the display for a readable heading. */
+  title: string;
+  /** The trailing ISO date, if the display carries one. */
+  date: string;
+  items: EncounterItem[];
+}
+
+/** A selection key. Must include the hiType -- see selectedItems' own note. */
+function itemKey(reference: string, hiType: string): string {
+  return `${reference}|${hiType}`;
+}
+
+/**
+ * INVERTS ABDM's GROUPING, WHICH IS THE WHOLE POINT OF THIS SCREEN'S
+ * REDESIGN. on-discover arrives grouped by hiType, so one visit appears
+ * once per record type it holds -- a real payload had
+ * "Essential Hypertension - 2026-07-15" listed under Invoice, under
+ * OPConsultation AND under Prescription. Rendered in ABDM's own order a
+ * patient sees the same date three times under three headings with no way
+ * to tell they are one visit, which is exactly the complaint.
+ *
+ * Regrouping by careContextReference gives the view a patient actually
+ * holds in their head: one section per visit, the record types inside it.
+ */
+function groupByEncounter(matches: PatientMatch[]): EncounterGroup[] {
+  const byReference = new Map<string, EncounterGroup>();
+
+  for (const match of matches) {
+    for (const cc of match.careContexts) {
+      if (cc.referenceNumber === "") continue;
+      let group = byReference.get(cc.referenceNumber);
+      if (group === undefined) {
+        const display = cc.display || cc.referenceNumber;
+        // "Condition - YYYY-MM-DD" is the shape every real display has
+        // carried so far. Split on the LAST separator so a condition with
+        // its own hyphen survives, and fall back to the whole string.
+        const dateMatch = display.match(/\s*[-–]\s*(\d{4}-\d{2}-\d{2})\s*$/);
+        group = {
+          reference: cc.referenceNumber,
+          display,
+          title: dateMatch ? display.slice(0, dateMatch.index).trim() : display,
+          date: dateMatch ? dateMatch[1] : "",
+          items: [],
+        };
+        byReference.set(cc.referenceNumber, group);
+      }
+      if (match.hiType !== "" && !group.items.some((i) => i.hiType === match.hiType)) {
+        group.items.push({
+          hiType: match.hiType,
+          patientReference: match.referenceNumber,
+          patientDisplay: match.display,
+        });
+      }
+    }
+  }
+
+  const groups = [...byReference.values()];
+  for (const group of groups) group.items.sort((a, b) => a.hiType.localeCompare(b.hiType));
+  // Newest visit first. A patient looking for "the one from last week"
+  // should not have to scan an arbitrary order.
+  groups.sort((a, b) => (b.date || "").localeCompare(a.date || "") || a.title.localeCompare(b.title));
+  return groups;
+}
+
+/**
+ * Rebuilds the patient[]/careContexts[] shape link-init expects, from the
+ * selected (visit, record type) pairs.
+ *
+ * Regrouping BACK to ABDM's hiType-first shape is what lets the screen
+ * present visits while the wire still carries what the spec documents --
+ * one patient entry per hiType, each listing only the visits selected for
+ * that type. A type with nothing selected is dropped entirely.
+ */
 function buildSelectedPatientPayload(matches: PatientMatch[], selected: Set<string>): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
   for (const match of matches) {
-    const keptContexts = match.careContexts.filter((cc) => selected.has(cc.referenceNumber));
+    const keptContexts = match.careContexts.filter((cc) => selected.has(itemKey(cc.referenceNumber, match.hiType)));
     if (keptContexts.length === 0) continue;
     out.push({
       referenceNumber: match.referenceNumber,
@@ -244,7 +336,14 @@ export function UilLinkScreen(): JSX.Element {
   const [discoverPollResult, setDiscoverPollResult] = useState<ApiResult<AbdmPassthrough> | null>(null);
   const [transactionId, setTransactionId] = useState("");
   const [patientMatches, setPatientMatches] = useState<PatientMatch[]>([]);
-  const [selectedContexts, setSelectedContexts] = useState<Set<string>>(new Set());
+  // KEYED ON (visit, record type), NOT ON THE VISIT ALONE. The old set held
+  // bare careContextReferences, and because ABDM lists the same visit under
+  // every hiType it holds, ticking it in one section silently ticked it in
+  // all the others -- and there was no way to link only the Prescription
+  // from a visit. The compound key is what makes each row mean one thing.
+  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+  /** Visits whose record-type list is expanded. Collapsed by default. */
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const [linkInitResult, setLinkInitResult] = useState<ApiResult<AbdmPassthrough> | null>(null);
   const [linkInitPollResult, setLinkInitPollResult] = useState<ApiResult<AbdmPassthrough> | null>(null);
@@ -325,7 +424,10 @@ export function UilLinkScreen(): JSX.Element {
           // Default: every discovered care context selected, per the task
           // spec's own "link all" as the simple default action -- the
           // patient can still deselect individual ones on the review step.
-          setSelectedContexts(new Set(matches.flatMap((m) => m.careContexts.map((cc) => cc.referenceNumber))));
+          // Everything on by default, per (visit, record type).
+          setSelectedItems(new Set(
+            matches.flatMap((m) => m.careContexts.map((cc) => itemKey(cc.referenceNumber, m.hiType))),
+          ));
           setPhase("review");
         },
         () => setPhase("discover_timeout"),
@@ -333,11 +435,36 @@ export function UilLinkScreen(): JSX.Element {
     });
   };
 
-  const toggleContext = (referenceNumber: string): void => {
-    setSelectedContexts((prev) => {
+  /** One record type of one visit. */
+  const toggleItem = (reference: string, hiType: string): void => {
+    setSelectedItems((prev) => {
       const next = new Set(prev);
-      if (next.has(referenceNumber)) next.delete(referenceNumber);
-      else next.add(referenceNumber);
+      const key = itemKey(reference, hiType);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  /** The whole visit: selects all its record types, or clears them all. */
+  const toggleEncounter = (group: EncounterGroup): void => {
+    setSelectedItems((prev) => {
+      const next = new Set(prev);
+      const keys = group.items.map((i) => itemKey(group.reference, i.hiType));
+      const allOn = keys.every((k) => next.has(k));
+      for (const k of keys) {
+        if (allOn) next.delete(k);
+        else next.add(k);
+      }
+      return next;
+    });
+  };
+
+  const toggleExpanded = (reference: string): void => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(reference)) next.delete(reference);
+      else next.add(reference);
       return next;
     });
   };
@@ -345,7 +472,7 @@ export function UilLinkScreen(): JSX.Element {
   const startLinkInit = (): void => {
     void run(async () => {
       setErrorMessage("");
-      const selectedPatientPayload = buildSelectedPatientPayload(patientMatches, selectedContexts);
+      const selectedPatientPayload = buildSelectedPatientPayload(patientMatches, selectedItems);
       const result = await uilLinkInit({
         xToken: sessionToken,
         hipId,
@@ -414,6 +541,10 @@ export function UilLinkScreen(): JSX.Element {
           }
           const linked = extractPatientMatches(row.detail);
           setConfirmedCount(linked.reduce((total, m) => total + m.careContexts.length, 0));
+          // Tell HomeScreen records are inbound, so it watches for them
+          // every few seconds instead of every thirty and says so on
+          // screen. See recentLink.ts for why the gap matters.
+          markRecentLink(hipId, hipName);
           setPhase("done");
         },
         () => setPhase("confirm_timeout"),
@@ -421,7 +552,13 @@ export function UilLinkScreen(): JSX.Element {
     });
   };
 
-  const selectedCount = selectedContexts.size;
+  const encounterGroups = groupByEncounter(patientMatches);
+  const selectedCount = selectedItems.size;
+  // Visits with at least one record type selected -- what the patient
+  // thinks of as "how many visits am I linking".
+  const selectedEncounterCount = encounterGroups.filter((g) =>
+    g.items.some((i) => selectedItems.has(itemKey(g.reference, i.hiType))),
+  ).length;
 
   return (
     <section>
@@ -483,32 +620,83 @@ export function UilLinkScreen(): JSX.Element {
               <EmptyState icon={Search} message="No care contexts were found for your ABHA address at this facility." />
             ) : (
               <>
-                <p className="muted">Everything found is selected by default — uncheck anything you don&apos;t want to link.</p>
-                {patientMatches.map((match) => (
-                  <Card key={match.referenceNumber} padding="sm" className="ui-card--flush">
-                    <CardBody>
-                      <div className="ui-card__header">
-                        <CardTitle>{match.display || match.hiType || "Record"}</CardTitle>
-                        <Badge tone="info">{match.hiType || "Unknown type"}</Badge>
-                      </div>
-                      {match.careContexts.map((cc) => (
-                        <label key={cc.referenceNumber} className="ui-list-row" style={{ cursor: "pointer" }}>
+                <p className="muted">
+                  One section per visit. Everything is selected by default — untick a whole visit,
+                  or open it to choose individual records.
+                </p>
+                {/* ONE SECTION PER VISIT, not per record type. ABDM sends
+                    these grouped by hiType, which repeats the same visit
+                    under every type it holds; groupByEncounter() inverts
+                    that so the list matches how a patient remembers their
+                    own care. */}
+                {encounterGroups.map((group) => {
+                  const keys = group.items.map((i) => itemKey(group.reference, i.hiType));
+                  const selectedHere = keys.filter((k) => selectedItems.has(k)).length;
+                  const allOn = selectedHere === keys.length && keys.length > 0;
+                  const isOpen = expanded.has(group.reference);
+                  return (
+                    <Card key={group.reference} padding="sm" className="ui-card--flush">
+                      <CardBody>
+                        <label className="ui-list-row" style={{ cursor: "pointer", alignItems: "flex-start" }}>
                           <input
                             type="checkbox"
-                            checked={selectedContexts.has(cc.referenceNumber)}
-                            onChange={() => toggleContext(cc.referenceNumber)}
+                            checked={allOn}
+                            // Partially-selected reads as neither on nor
+                            // off, which is the truth and stops a half
+                            // selection looking like a full one.
+                            ref={(el) => { if (el) el.indeterminate = selectedHere > 0 && !allOn; }}
+                            onChange={() => toggleEncounter(group)}
                           />
-                          <span className="ui-list-row__label">{cc.display || cc.referenceNumber}</span>
+                          <span className="ui-list-row__label">
+                            <strong>{group.title}</strong>
+                            {group.date !== "" && <span className="muted"> · {group.date}</span>}
+                            <br />
+                            <span className="muted" style={{ fontSize: "0.85em" }}>
+                              {selectedHere} of {group.items.length} record
+                              {group.items.length === 1 ? "" : "s"} selected
+                            </span>
+                          </span>
                         </label>
-                      ))}
-                    </CardBody>
-                  </Card>
-                ))}
+
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => toggleExpanded(group.reference)}
+                        >
+                          {isOpen ? "Hide records" : `Choose records (${group.items.length})`}
+                        </Button>
+
+                        {isOpen && (
+                          <div style={{ marginTop: 8, marginLeft: 24 }}>
+                            {group.items.map((item) => (
+                              <label
+                                key={item.hiType}
+                                className="ui-list-row"
+                                style={{ cursor: "pointer" }}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={selectedItems.has(itemKey(group.reference, item.hiType))}
+                                  onChange={() => toggleItem(group.reference, item.hiType)}
+                                />
+                                <span className="ui-list-row__label">
+                                  <Badge tone="info">{item.hiType}</Badge>
+                                </span>
+                              </label>
+                            ))}
+                          </div>
+                        )}
+                      </CardBody>
+                    </Card>
+                  );
+                })}
                 <Callout tone="warning" icon={Send}>
                   Linking will send a <strong>real OTP</strong> to your registered mobile via {hipName}.
                 </Callout>
                 <Button variant="primary" icon={Link2} disabled={busy || selectedCount === 0} onClick={startLinkInit}>
-                  {busy ? "Starting…" : `Link ${selectedCount} selected record${selectedCount === 1 ? "" : "s"}`}
+                  {busy
+                    ? "Starting…"
+                    : `Link ${selectedCount} record${selectedCount === 1 ? "" : "s"} from ${selectedEncounterCount} visit${selectedEncounterCount === 1 ? "" : "s"}`}
                 </Button>
               </>
             )}

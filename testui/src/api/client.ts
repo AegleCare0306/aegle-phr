@@ -63,14 +63,25 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   const startedAt = new Date().toISOString();
   const started = Date.now();
 
-  // ngrok's free plan serves an interstitial warning page to anything that
-  // looks like a browser, so a request from the deployed page gets HTML back
-  // instead of JSON. This header opts out of it. Harmless when the backend is
-  // not behind ngrok. Set here, in the single choke point, so no screen can
-  // forget it.
+  // TUNNEL INTERSTITIAL OPT-OUTS. Both ngrok and zrok serve an HTML warning
+  // page to anything whose User-Agent looks like a browser, so a request
+  // from the deployed page gets HTML back instead of JSON -- and, worse,
+  // that HTML response carries NO Access-Control-Allow-Origin header, so
+  // the browser rejects it before any of our code sees it and the app
+  // reports the backend as unreachable. Confirmed live 2026-10-03 after
+  // moving to zrok: curl worked perfectly and the Vercel page could not
+  // connect at all, purely because of the User-Agent difference.
+  //
+  // The CORS PREFLIGHT is not affected -- zrok answers OPTIONS normally and
+  // echoes these header names back as allowed -- so adding them here is
+  // enough; no server-side change is needed.
+  //
+  // Harmless when the backend is behind neither tunnel. Set here, in the
+  // single choke point, so no screen can forget one.
   const requestHeaders: Record<string, string> = {
     [ACCESS_KEY_HEADER]: config.apiKey,
     "ngrok-skip-browser-warning": "true",
+    skip_zrok_interstitial: "1",
   };
   if (options.body !== undefined) requestHeaders["Content-Type"] = "application/json";
 

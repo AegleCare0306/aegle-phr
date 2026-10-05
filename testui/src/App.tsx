@@ -1,6 +1,6 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useNavigate } from "react-router-dom";
-import { Activity, AtSign, Bell, Building2, Home, IdCard, LogIn, LogOut, Mail, Moon, ScanFace, ShieldCheck, Smartphone, Sun, User, UserPlus } from "lucide-react";
+import { Activity, AtSign, Bell, Building2, Home, IdCard, LogIn, LogOut, Mail, Moon, ScanFace, ScanLine, ShieldCheck, Smartphone, Sun, User, UserPlus } from "lucide-react";
 
 import { ConsolePanel } from "./components/ConsolePanel";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -34,6 +34,7 @@ import { OtpLoginScreen } from "./routes/OtpLoginScreen";
 import { PasswordLoginScreen } from "./routes/PasswordLoginScreen";
 import { ProfileScreen } from "./routes/ProfileScreen";
 import { ProviderDirectoryScreen } from "./routes/ProviderDirectoryScreen";
+import { ScanShareScreen } from "./routes/ScanShareScreen";
 import { SubscriptionsScreen } from "./routes/SubscriptionsScreen";
 import { UilLinkScreen } from "./routes/UilLinkScreen";
 import { getConfig, isConfigured, setConfig } from "./config";
@@ -54,16 +55,41 @@ import { useConnection } from "./useConnection";
  * without losing their place, and the connection check runs once regardless
  * of which route is current.
  */
-/** The 5 primary logged-in destinations -- Consent Manager sits in the
- * middle and gets the reference app's raised-circular treatment (its own
- * equivalent of the reference's QR-scan button; nothing in this app is a
- * closer match for "the one action that deserves to stand out"). */
+/** The 3 primary logged-in destinations, with Scan raised in the middle.
+ *
+ * WHY THREE AND NOT FIVE (Aayush's call, 2026-09-29, and he was right).
+ * P22 first took Consent out of the raised slot for Scan -- correct, since
+ * BottomNav's own docstring calls that slot "the reference app's QR-scan
+ * treatment" and Scan & Share is literally that -- but then dropped
+ * PROVIDERS to the drawer to stay at five. That broke something real:
+ * User-Initiated Linking has exactly ONE entry point in this whole app, the
+ * "Link this facility" button on a ProviderDirectoryScreen result
+ * (App.tsx's own /link/:hipId route is not something a tester navigates to
+ * by hand). Burying Providers therefore buried UIL, which is a whole spec
+ * section, to keep a lookup screen out of sight.
+ *
+ * So the bar now carries only what a patient standing somewhere actually
+ * does -- go home, scan a counter QR, find a facility to link -- and
+ * EVERYTHING lives in the drawer as well, including these three. Fewer
+ * tabs, nothing unreachable.
+ *
+ * Profile, Consent and Subscriptions are drawer-only now. They are
+ * destinations you go to deliberately, not ones you tab between. */
 const PRIMARY_NAV: BottomNavItem[] = [
   { to: "/home", label: "Home", icon: Home },
-  { to: "/profile", label: "Profile", icon: User },
-  { to: "/consent", label: "Consent", icon: ShieldCheck, raised: true },
-  { to: "/subscriptions", label: "Subscriptions", icon: Bell },
+  { to: "/scan", label: "Scan", icon: ScanLine, raised: true },
   { to: "/providers", label: "Providers", icon: Building2 },
+];
+
+/** Every logged-in destination, for the drawer. The bar is a shortcut to
+ * three of these, never the only way to reach anything. */
+const ALL_DESTINATIONS: { to: string; label: string; icon: typeof Home }[] = [
+  { to: "/home", label: "Home", icon: Home },
+  { to: "/scan", label: "Scan & Share", icon: ScanLine },
+  { to: "/providers", label: "Providers (and linking)", icon: Building2 },
+  { to: "/profile", label: "Profile", icon: User },
+  { to: "/consent", label: "Consent", icon: ShieldCheck },
+  { to: "/subscriptions", label: "Subscriptions", icon: Bell },
 ];
 
 function AppShell(): JSX.Element {
@@ -121,14 +147,21 @@ function AppShell(): JSX.Element {
       <TopBar onMenuClick={() => setMenuOpen(true)} />
 
       <MenuDrawer open={menuOpen} onClose={() => setMenuOpen(false)}>
-        {/* Direct jumps for testing -- every route is still reachable by URL
-            regardless of what's shown here. LOGGED OUT: no bottom nav yet
-            (nothing to navigate within an "app" the tester hasn't entered),
-            so the four entry points that used to live in the old top nav
-            move here instead. LOGGED IN: these same 5 destinations already
-            live in the bottom tab bar, so the drawer's own nav section is
-            just Logout -- repeating all 5 here too would just be the old
-            cluttered nav bar relocated, not fixed. */}
+        {/* Direct jumps -- every route is also reachable by URL regardless
+            of what's shown here.
+
+            LOGGED OUT: no bottom nav yet (nothing to navigate within an
+            "app" the tester hasn't entered), so the four entry points that
+            used to live in the old top nav move here instead.
+
+            LOGGED IN: this now lists EVERY destination, which reverses what
+            this comment used to say. The old rule was that repeating the
+            bar's 5 tabs here "would just be the old cluttered nav bar
+            relocated" -- fair while the bar held all 5. The bar now holds 3
+            (see PRIMARY_NAV), so a drawer that only offered Logout would
+            leave Profile, Consent and Subscriptions with no visible route
+            at all. The bar is a shortcut to the three things a patient does
+            standing up; this is the full map. */}
         {!loggedIn && (
           <div className="ui-menu-drawer__section">
             <p className="ui-menu-drawer__section-title">Get started</p>
@@ -139,9 +172,23 @@ function AppShell(): JSX.Element {
           </div>
         )}
         {loggedIn && (
-          <div className="ui-menu-drawer__section">
-            <ListRow icon={LogOut} onClick={() => { setMenuOpen(false); logout(); }}>Logout</ListRow>
-          </div>
+          <>
+            <div className="ui-menu-drawer__section">
+              <p className="ui-menu-drawer__section-title">Go to</p>
+              {ALL_DESTINATIONS.map((destination) => (
+                <ListRow
+                  key={destination.to}
+                  icon={destination.icon}
+                  onClick={() => { setMenuOpen(false); navigate(destination.to); }}
+                >
+                  {destination.label}
+                </ListRow>
+              ))}
+            </div>
+            <div className="ui-menu-drawer__section">
+              <ListRow icon={LogOut} onClick={() => { setMenuOpen(false); logout(); }}>Logout</ListRow>
+            </div>
+          </>
         )}
 
         {/* Test-harness controls -- still here, just no longer pinned to
@@ -396,6 +443,14 @@ function AppShell(): JSX.Element {
               the full continuous discover -> review -> OTP -> confirm
               flow this one route covers. */}
           <Route path="/link/:hipId" element={<UilLinkScreen />} />
+
+          {/* Scan & Share (spec section 5) -- P22, the patient end of the
+              facility-side flow repo/ builds. Its own top-level route and
+              the raised nav slot, because it is the one action in this app
+              a patient performs standing at a reception desk. See
+              ScanShareScreen.tsx's own banner for the three input paths
+              and the two-mechanism token wait. */}
+          <Route path="/scan" element={<ScanShareScreen />} />
 
           <Route path="/health" element={<HealthScreen />} />
           {/* Unknown paths land on login rather than a dead end. */}

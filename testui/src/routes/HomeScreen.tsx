@@ -105,6 +105,8 @@ import {
   triggerConsentFetch,
 } from "../api/endpoints";
 import type { LockerRecord, LockerStatus } from "../api/endpoints";
+import { clearRecentLink, getRecentLink } from "../recentLink";
+import type { RecentLink } from "../recentLink";
 import type { AbdmPassthrough, ApiResult } from "../api/types";
 import { RawBody } from "../components/RawBody";
 import { Badge } from "../components/ui/Badge";
@@ -1043,6 +1045,14 @@ export function HomeScreen(): JSX.Element {
   /** P20 -- NOT_STARTED / RUNNING / DONE / FAILED for the one-off backfill. */
   const [lockerSyncState, setLockerSyncState] = useState<string>("");
   const [lockerRecordCount, setLockerRecordCount] = useState<number>(0);
+  // A link confirmed moments ago in UilLinkScreen, whose records are
+  // still in flight. Drives both the fast poll and the banner below --
+  // see recentLink.ts for why a 30s refresh is not good enough here.
+  const [pendingLink, setPendingLink] = useState<RecentLink | null>(() => getRecentLink());
+  // Care contexts we already hold a bundle for. Lets a lean poll tell
+  // "nothing new" from "something arrived" without carrying the
+  // bundles themselves. A ref, not state: it must not trigger renders.
+  const heldCareContextsRef = useRef<Set<string>>(new Set());
   const [optInBusy, setOptInBusy] = useState(false);
 
   /** Re-reads locker status after the patient answers the opt-in prompt. */
@@ -1062,7 +1072,7 @@ export function HomeScreen(): JSX.Element {
     try {
       await setupPatientLocker({ xToken: sessionToken, patientAbhaAddress: sessionAddress });
       await refreshLockerStatus();
-      await loadLockerRecords();
+      await loadLockerRecords(true);
     } finally {
       setOptInBusy(false);
     }
@@ -1086,11 +1096,22 @@ export function HomeScreen(): JSX.Element {
    * consents before returning anything, so a record we are no longer
    * entitled to hold disappears here on the very next read.
    */
-  async function loadLockerRecords(): Promise<void> {
+  /**
+   * Reads the locker.
+   *
+   * `withBundles` IS THE EXPENSIVE SWITCH. Bundles are the actual FHIR
+   * documents and make this response roughly 2 MB; everything else is a
+   * couple of KB. Polling with bundles on cost 49 MB in 24 polls on the
+   * tunnel (2026-10-03) for bytes the screen already had. So: fetch them
+   * on the first load and whenever a lean poll reveals a care context we
+   * are not holding yet, and never on the routine poll itself.
+   */
+  async function loadLockerRecords(withBundles = false): Promise<void> {
     if (sessionAddress === "") return;
     const result = await getLockerRecords({
       patientAbhaAddress: sessionAddress,
       xToken: sessionToken,
+      includeBundles: withBundles,
     });
     const body = result.data?.body as
       | { records?: LockerRecord[]; count?: number; initialSyncState?: string }
@@ -1100,11 +1121,45 @@ export function HomeScreen(): JSX.Element {
     setLockerSyncState(body.initialSyncState ?? "");
     setLockerRecordCount(body.count ?? 0);
 
-    const seeded = pullStateFromLockerRecords(body.records ?? []);
+    const arrived = body.records ?? [];
+
+    // A lean poll that turns up something new is the ONLY thing that
+    // triggers the expensive call. One 2 MB fetch when a record actually
+    // appears, instead of one every thirty seconds forever.
+    if (!withBundles) {
+      const known = heldCareContextsRef.current;
+      const unseen = arrived.filter((r) => !known.has(r.careContextReference));
+      if (unseen.length > 0) {
+        // MARK BEFORE FETCHING, not after. If the full fetch below fails
+        // (expired key, tunnel blip), the ref would otherwise stay empty
+        // and the NEXT lean poll would escalate again, and the one after
+        // that -- turning the cheap poll back into a 2 MB one every few
+        // seconds, which is the exact problem this is here to prevent.
+        // Recording the attempt makes escalation at-most-once per care
+        // context; a success overwrites this with the true set anyway.
+        for (const record of unseen) known.add(record.careContextReference);
+        await loadLockerRecords(true);
+        return;
+      }
+    } else {
+      heldCareContextsRef.current = new Set(arrived.map((r) => r.careContextReference));
+    }
+
+    const seeded = pullStateFromLockerRecords(arrived);
     // MERGE, not replace: a HIP the patient has manually pulled during
     // this session keeps that pull state, because it may hold something
     // the locker has not collected yet.
     setPullStateByHip((current) => ({ ...current, ...seeded }));
+
+    // The records we were waiting on have arrived -- stop watching and
+    // drop the banner. Matched on the specific hospital, not on the total
+    // count, so an unrelated record landing first cannot end the wait
+    // early and leave the linked one still missing.
+    const awaited = getRecentLink();
+    if (awaited !== null && arrived.some((r) => r.hipId === awaited.hipId)) {
+      clearRecentLink();
+      setPendingLink(null);
+    }
   }
 
   useEffect(() => {
@@ -1146,7 +1201,11 @@ export function HomeScreen(): JSX.Element {
       // passed for one reason only -- if the one-off backfill has never
       // run, it is what lets the backend start it (in the background;
       // this call does not wait for it, and the poll below picks it up).
-      void loadLockerRecords();
+      //
+      // WITH BUNDLES: this is the one load that must hydrate the screen,
+      // so it pays the ~2 MB once. Every poll after it goes lean -- see
+      // loadLockerRecords()'s own docstring.
+      void loadLockerRecords(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionToken]);
@@ -1199,6 +1258,42 @@ export function HomeScreen(): JSX.Element {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lockerSyncState, sessionToken, sessionAddress]);
+
+  /*
+   * P22 -- A RECORD JUST LINKED SHOULD APPEAR NOW, NOT WITHIN 30 SECONDS.
+   *
+   * The locker collects a newly linked visit on its own in about seven
+   * seconds (link-confirm -> 8.3.11 alert -> consent -> auto-approve ->
+   * fetch -> data request -> push, measured live 2026-10-03). The standing
+   * refresh above runs every 30 seconds, so a patient who links a record
+   * and goes straight to this screen could sit in front of an empty list
+   * for most of a minute with nothing saying more was coming. That reads
+   * as broken, and was read as broken.
+   *
+   * So while a link is pending, poll at the SAME cadence the backfill uses
+   * -- the patient is actively waiting in both cases -- and let the banner
+   * below explain the wait. Bounded by recentLink.ts's own window, after
+   * which this stops and the 30-second refresh takes over again.
+   */
+  useEffect(() => {
+    if (pendingLink === null || sessionAddress === "") return;
+
+    void loadLockerRecords();
+    const timer = window.setInterval(() => {
+      // Re-read rather than trusting the captured value: the marker
+      // expires on read, so this ends on its own even if the records never
+      // arrive.
+      const still = getRecentLink();
+      if (still === null) {
+        setPendingLink(null);
+        return;
+      }
+      void loadLockerRecords();
+    }, BACKFILL_POLL_MS);
+
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingLink, sessionAddress, sessionToken]);
 
   const linkedRecords = extractLinkedRecords(linksResult?.data?.body ?? null);
   const coveringConsents = extractCoveringConsents(consentArtefactsResult?.data?.body ?? null, lockerId);
@@ -1694,6 +1789,17 @@ export function HomeScreen(): JSX.Element {
         while the backfill is actually RUNNING; a synced locker never
         renders it, because after that first pass records are already here.
       */}
+      {/* P22 -- the newly-linked-records wait, made visible. Without this
+          the screen simply reads "no records" for the few seconds the
+          locker takes to collect them, which is how a working system gets
+          mistaken for a broken one. Shown ABOVE the backfill banner
+          because it is the more immediate thing the patient just did. */}
+      {pendingLink !== null && (
+        <Callout tone="info">
+          Collecting your records from {pendingLink.hipName} — this usually takes a few seconds.
+          They will appear below as soon as they arrive.
+        </Callout>
+      )}
       {lockerSyncState === "RUNNING" && (
         <Callout tone="info">
           Collecting your existing records from your hospitals — this happens once, and takes a few

@@ -643,6 +643,13 @@ class LockerRecordsBody(BaseModel):
     """
     Reads what the locker currently holds for this patient.
 
+    includeBundles DEFAULTS TO FALSE, deliberately. A bundle is a full FHIR
+    document (23 KB - 795 KB each, measured live), so including them makes
+    this response ~2 MB for a normal history. This endpoint is POLLED, and
+    on 2026-10-03 that cost 49 MB across 24 polls on a 1 GB monthly tunnel
+    allowance. The screen asks for bundles once at login, and again only
+    when a metadata-only poll shows a care context it does not yet hold.
+
     xToken is OPTIONAL and is used for one thing only: if the one-off
     backfill has never run, it is what lets the locker read the patient's
     linked records to start it. Omitting it still returns everything
@@ -652,6 +659,7 @@ class LockerRecordsBody(BaseModel):
 
     patientAbhaAddress: str = Field(min_length=1)
     xToken: str = ""
+    includeBundles: bool = False
 
 
 class LockerInitialSyncBody(BaseModel):
@@ -842,3 +850,59 @@ class UilLinkConfirmBody(BaseModel):
     # that sent the five documented fields, including the frontend's own
     # (testui's UilLinkConfirmBody has never carried it). It made 10.3.9
     # uncallable from the UI. Found live on the first real confirm.
+
+
+# ---------------------------------------------------------------------------
+# P22 -- Scan & Share (spec section 5), patient side.
+# ---------------------------------------------------------------------------
+
+
+class ScanShareParseBody(BaseModel):
+    """
+    Whatever came out of the QR decoder, or whatever the patient pasted.
+
+    Deliberately a single free-text field rather than hipId/counterId:
+    parsing is the point of the route, and the frontend should never be
+    the thing that decides a scanned string is well-formed.
+    """
+
+    scanned: str = Field(min_length=1)
+
+
+class ScanShareShareBody(BaseModel):
+    """
+    The share itself.
+
+    `patient` IS SUPPLIED BY THE FRONTEND, NOT RE-FETCHED SERVER-SIDE, and
+    that is a deliberate privacy property rather than laziness: the consent
+    screen shows the patient the exact fields that will be sent, and the
+    only way to guarantee that what was shown is what goes is to send back
+    what was shown. A server-side re-fetch could differ from the screen.
+
+    Typed as a loose dict for the same reason every other body in this file
+    that carries an ABDM-shaped object is: the shape belongs to ABDM, and
+    aegle_phr/phr/profile_share.py's own _clean_patient() is what
+    normalises it (dropping an empty abhaNumber, settling the
+    pincode/pinCode spelling) right before the call.
+    """
+
+    xToken: str = Field(min_length=1)
+    hipId: str = Field(min_length=1)
+    # NOT min_length=1 -- a facility may legitimately display one QR for the
+    # whole desk rather than one per counter. See parse_scanned_qr().
+    counterId: str = ""
+    patient: dict[str, Any]
+
+
+class ScanShareTokenDetailsBody(BaseModel):
+    """
+    CANDIDATE B for how the queue token gets back to the patient -- see
+    aegle_phr/phr/profile_share.py's own banner for the two-mechanism fork
+    and why both are built.
+
+    `limit` defaults to -1, which is what our Postman collection's saved
+    request sends.
+    """
+
+    xToken: str = Field(min_length=1)
+    limit: int = -1

@@ -44,7 +44,7 @@ from abdm_core.callback_auth import verify_abdm_callback
 from abdm_core.http import generate_request_id
 from abdm_core.observability.flow_logger import log_error, set_correlation_id
 
-from aegle_phr.callbacks import hiu_services, subscription_services, uil_services
+from aegle_phr.callbacks import hiu_services, profile_share_services, subscription_services, uil_services
 from aegle_phr.callbacks.dispatcher import dispatch
 from aegle_phr.settings import Settings
 
@@ -57,8 +57,18 @@ from aegle_phr.settings import Settings
 # each is likewise unconfirmed -- which is precisely why this chunk stores
 # the body verbatim as JSONB and parses nothing beyond the envelope
 # requestId. on_discover/on_init/on_confirm got real per-callback handling
-# in P15 (_UIL_HANDLERS below); on_share remains archive-only, no chunk has
-# built it yet.
+# in P15 (_UIL_HANDLERS below).
+#
+# on_share got its own handler in P22 (_PROFILE_SHARE_HANDLERS below) -- it
+# is no longer archive-only. Its PAYLOAD SHAPE remains genuinely unknown,
+# though, more so than any other callback here: no sample exists in the
+# spec, in either Postman collection, or in NHA's reference wrapper, which
+# implements only the HIP side of Scan & Share. That handler therefore
+# searches several candidate shapes rather than parsing one, and logs
+# loudly when it finds no token -- see
+# aegle_phr/callbacks/profile_share_services.py's own banner. Whether ABDM
+# calls this path at ALL is itself unproven; the poll
+# (getTokenDetails) is built alongside it for exactly that reason.
 CALLBACK_ROUTES: tuple[tuple[str, str], ...] = (
     ("/api/v3/hiu/patient/care-context/on-discover", "on_discover"),
     ("/api/v3/hiu/patient/care-context/on-init", "on_init"),
@@ -95,6 +105,15 @@ _UIL_HANDLERS: dict[str, Callable[[Settings, Any, str | None], None]] = {
     "on_discover": lambda settings, payload, request_id_header: uil_services.handle_on_discover(settings, payload, request_id_header),
     "on_init": lambda settings, payload, request_id_header: uil_services.handle_on_init(settings, payload, request_id_header),
     "on_confirm": lambda settings, payload, request_id_header: uil_services.handle_on_confirm(settings, payload, request_id_header),
+}
+
+# P22 -- Scan & Share's one inbound callback. Its OWN dict, alongside the
+# three above rather than folded into any of them, matching the
+# per-feature-area convention this module already states. One entry today;
+# the separation is about which feature owns which callback, not about how
+# many there are.
+_PROFILE_SHARE_HANDLERS: dict[str, Callable[[Settings, Any, str | None], None]] = {
+    "on_share": lambda settings, payload, request_id_header: profile_share_services.handle_on_share(settings, payload, request_id_header),
 }
 
 # P20 -- the five HIU paths from this module's own banner, registered ONLY
@@ -181,6 +200,7 @@ def _make_handler(callback_type: str, settings: Settings):
         real_handler = (
             _SUBSCRIPTION_HANDLERS.get(callback_type)
             or _UIL_HANDLERS.get(callback_type)
+            or _PROFILE_SHARE_HANDLERS.get(callback_type)
             or _HIU_HANDLERS.get(callback_type)
         )
         if real_handler is not None:
